@@ -1,4 +1,158 @@
-````markdown
+# M2E — Motion to Envelopes
+
+**M2E** extracts motion from video and converts it into **time-aligned control envelopes**.
+
+Those envelopes can be exported as:
+- **MIDI CC** (DAW-agnostic, real-time capable)
+- **CSV** (high-resolution automation for DAWs or custom tooling)
+
+M2E is not about notes, beats, or musical sequencing.  
+It is about **motion → envelopes → sound**.
+
+If something moves on screen, M2E lets that motion *cause* sound — not just decorate it.
+
+---
+
+## What problem M2E solves
+
+Sound design for animation usually means:
+- scrubbing picture
+- guessing where motion “feels” intense
+- hand-drawing automation
+- fixing drift and over-reaction later
+
+M2E replaces that with **measured motion envelopes** derived directly from the video:
+- speed
+- acceleration
+- jerk (sudden change)
+- directionality
+- entropy / texture
+- impacts and state transitions
+
+These envelopes are **time-accurate to picture** and can drive:
+- foley intensity
+- granular density
+- transient layers
+- reverb and space
+- modulation depth
+- spatial motion
+
+M2E does not decide *what* the sound should be.  
+It gives you envelopes that let motion decide *when and how much*.
+
+---
+
+## What M2E is (and is not)
+
+**M2E is:**
+- a motion analysis tool
+- an envelope generator
+- a bridge between animation and sound
+- conservative and confidence-aware
+
+**M2E is not:**
+- automatic sound design
+- a note-based MIDI sequencer
+- a “magic” optical-flow black box
+- a hallucination engine
+
+When motion is ambiguous, M2E prefers restraint over invention.
+
+---
+
+## Core idea (important)
+
+M2E exports **state**, not events.
+
+- MIDI CC is just a **carrier**
+- CSV is just a **carrier**
+- the invariant is the **envelope over time**
+
+This is why M2E works across:
+- DAWs
+- engines
+- workflows
+- future formats you haven’t invented yet
+
+---
+
+## Output formats
+
+### MIDI CC (default)
+- DAW-agnostic
+- Real-time capable
+- Scrub-friendly (seek-safe mode)
+- Portable
+
+> Note: MIDI contains **CC only** (no notes).
+
+### CSV
+- Full-resolution envelopes
+- Ideal for:
+  - REAPER automation
+  - analysis
+  - custom pipelines
+  - research
+
+---
+
+## Timing model (critical)
+
+M2E uses a **wall-clock MIDI mapping**:
+
+- **Tempo = 60 BPM**
+- **1 beat = 1 second**
+- **PPQ = 960**
+
+This ensures:
+- envelopes align to video time
+- no drift
+- no musical assumptions
+
+If your DAW asks to import a tempo map:
+- **Decline**, unless you explicitly want the project set to 60 BPM.
+
+The tempo map only defines how MIDI ticks map to seconds.  
+It does **not** affect audio or video unless you tell the DAW to use it.
+
+---
+
+## When to use M2E
+
+Use M2E when:
+- motion matters
+- timing matters
+- you want sound to feel *caused* by movement
+- you want repeatable, inspectable behavior
+
+Do not use M2E when:
+- motion is irrelevant
+- everything should be purely musical
+- hand-drawn automation is the goal
+
+---
+
+## Learn more (recommended)
+
+- **Quickstart** — see below for a 5-minute workflow
+- **TECHNICAL.md** — deep dive into:
+  - camera motion
+  - occlusion
+  - smooth shading failures
+  - IG-LoG / structural confidence
+  - HG vs Farnebäck modes
+  - temporal shaping
+  - psychoacoustics and salience
+
+If you want to understand *why* something behaves the way it does, start there.
+
+---
+
+## Philosophy (one sentence)
+
+M2E turns motion into envelopes, not decisions — so your sound feels *caused*, not decorated.
+
+
 ## Quickstart (ground-truthed from `Local Motion Tracker.py`)
 
 Run:
