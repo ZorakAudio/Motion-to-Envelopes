@@ -1,0 +1,17 @@
+desc:FluxBridge Receiver (7ch)
+slider1:env=0<0,1,0.0001>Env
+slider2:dirx=0<0,1,0.0001>Dir X
+slider3:diry=0<0,1,0.0001>Dir Y
+slider4:posx=0<0,1,0.0001>Pos X
+slider5:posy=0<0,1,0.0001>Pos Y
+slider6:dirz=0<0,1,0.0001>Dir Z
+slider7:posz=0<0,1,0.0001>Pos Z
+
+@init
+// no DSP; just exposes sliders so envelopes can target them
+@gfx 200 120
+gfx_clear=0;
+gfx_x=gfx_y=8;
+gfx_set(1,1,1);
+gfx_drawstr("FluxBridge Receiver (7ch)\nEnv, DirX, DirY, PosX, PosY, DirZ, PosZ");
+

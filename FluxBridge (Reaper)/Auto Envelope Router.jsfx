@@ -1,0 +1,196 @@
+desc:Auto Envelope Router
+author:auto
+options:no_meter
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+out_pin:vx_s
+out_pin:vy_s
+out_pin:vz_s
+out_pin:wyaw_s
+out_pin:wpitch_s
+out_pin:wroll_s
+out_pin:acc_s
+out_pin:flux_n
+out_pin:amp_low
+out_pin:amp_mid
+out_pin:amp_high
+// out_pin:entropy    // NEW: entropy control DC
+
+// out_pin:jerk
+
+// ---- LEGACY SLIDERS (DO NOT RENAME / REORDER) ----
+// modulators / inputs (driven by envelopes from your CSV importer)
+slider1:flux_n=0<0,1,0.001>flux_n
+slider2:acc_s=0<-1,1,0.001>acc_s
+
+// velocities (signed)
+slider3:vx_s=0<-1,1,0.001>vx_s
+slider4:vy_s=0<-1,1,0.001>vy_s
+slider5:vz_s=0<-1,1,0.001>vz_s
+
+// angular (signed)
+slider6:wyaw_s=0<-1,1,0.001>wyaw_s
+slider7:wpitch_s=0<-1,1,0.001>wpitch_s
+slider8:wroll_s=0<-1,1,0.001>wroll_s
+
+// amplitude buckets (0..1)
+slider9:amp_low=0<0,1,0.001>amp_low
+slider10:amp_mid=0<0,1,0.001>amp_mid
+slider11:amp_high=0<0,1,0.001>amp_high
+
+// timing helpers (kept for compatibility; not altering smoothing)
+slider12:itd_ms=0<0,50,0.001>itd_ms
+slider13:push_ms=0<0,500,0.001>push_ms
+
+// FM helpers (kept; pass-through here)
+slider14:fm_low_hz=0<0,10,0.001>fm_low_hz
+slider15:fm_mid_hz=0<0,20,0.001>fm_mid_hz
+slider16:fm_high_hz=0<0,40,0.001>fm_high_hz
+
+// global envelope smoothing time constant
+slider17:smooth_ms=100<0,200,1>Envelope smoothing (ms)
+
+// ---- NEW SAFE EXTRAS (100+) ----
+slider101:apply_smoothed=1<0,1,1>{Raw to params,Smoothed to params}Apply smoothing to parameter values
+slider102:ctrl_out_gain_db=0<-24,24,0.1>Control DC out gain (dB)
+slider103:jerk=0<-100000,100000,1>Jerk
+slider104:entropymotion=0<0,1,0.001>entropymotion
+slider105:entropylog2=0<0,1,0.001>entropylog2
+
+
+// ---------------- INTERNAL ----------------
+@init
+two_pi = 2*$pi;
+denorm = 0.000000000000000000000000000001;
+sr = srate > 0 ? srate : 48000;
+
+// state for smoothed lanes
+vx_sm=0; vy_sm=0; vz_sm=0;
+wyaw_sm=0; wpitch_sm=0; wroll_sm=0;
+acc_sm=0; flux_sm=0;
+alow_sm=0; amid_sm=0; ahigh_sm=0;
+entropy_sm=0;        // NEW
+entropy_motion_sm=0;
+entropy_log2_sm=0;
+
+// clamp helpers
+function clamp01(x) (x<0?0:(x>1?1:x));
+function clamp11(x) (x<-1?-1:(x>1?1:x));
+
+// compute one-pole block coefficient for time-constant tau seconds
+function k_block(samples, tau_s)
+(
+  tau_s <= 0 ? 0 // immediate
+  : exp(-samples / (max(0.000001, tau_s) * sr));
+);
+
+// dB to linear
+function db2lin(db) (pow(10, db/20));
+
+// ---------------- SLIDERS ----------------
+@slider
+sr = srate > 0 ? srate : sr;
+tau_s = smooth_ms * 0.001;  // seconds
+out_gain = db2lin(ctrl_out_gain_db);
+
+// ---------------- AUDIO/CONTROL ----------------
+@block
+// 1) capture current targets from envelopes (host writes these before @block)
+vx_t = clamp11(vx_s);
+vy_t = clamp11(vy_s);
+vz_t = clamp11(vz_s);
+
+wyaw_t   = clamp11(wyaw_s);
+wpitch_t = clamp11(wpitch_s);
+wroll_t  = clamp11(wroll_s);
+
+// jerk_t = clamp11(jerk);
+acc_t  = clamp11(acc_s);
+flux_t = clamp01(flux_n);
+
+alow_t  = clamp01(amp_low);
+amid_t  = clamp01(amp_mid);
+ahigh_t = clamp01(amp_high);
+
+//entropy_t = clamp01(entropy_n);   // NEW: 0..1 entropy target
+entropy_motion_t = clamp01(entropy_motion);
+entropy_log2_t   = clamp01(entropy_log2);
+
+
+
+// 2) compute smoothing factor for this block (sample-accurate equivalent for constant target)
+k = k_block(samplesblock, tau_s);
+one_minus_k = 1 - k;
+
+// 3) update smoothed states
+vx_sm    = k*vx_sm    + one_minus_k*vx_t   + denorm;
+vy_sm    = k*vy_sm    + one_minus_k*vy_t   + denorm;
+vz_sm    = k*vz_sm    + one_minus_k*vz_t   + denorm;
+
+wyaw_sm   = k*wyaw_sm   + one_minus_k*wyaw_t   + denorm;
+wpitch_sm = k*wpitch_sm + one_minus_k*wpitch_t + denorm;
+wroll_sm  = k*wroll_sm  + one_minus_k*wroll_t  + denorm;
+
+acc_sm   = k*acc_sm   + one_minus_k*acc_t   + denorm;
+flux_sm  = k*flux_sm  + one_minus_k*flux_t  + denorm;
+// jerk_sm = k*jerk_sm + one_minus_k*jerk_t + denorm;
+
+alow_sm  = k*alow_sm  + one_minus_k*alow_t  + denorm;
+amid_sm  = k*amid_sm  + one_minus_k*amid_t  + denorm;
+ahigh_sm = k*ahigh_sm + one_minus_k*ahigh_t + denorm;
+
+entropy_motion_sm = k*entropy_motion_sm + one_minus_k*entropy_motion_t + denorm;
+entropy_log2_sm   = k*entropy_log2_sm   + one_minus_k*entropy_log2_t   + denorm;
+
+
+//entropy_sm = k*entropy_sm + one_minus_k*entropy_t + denorm; // NEW
+
+
+// 4) optionally write smoothed values back to the same parameters (for FX-parameter linking)
+apply_smoothed ? (
+  // NOTE: host sets targets again next block; we always read them first, then overwrite for linking.
+  vx_s     = vx_sm;     // idx 3
+  vy_s     = vy_sm;     // idx 4
+  vz_s     = vz_sm;     // idx 5
+  wyaw_s   = wyaw_sm;   // idx 6
+  wpitch_s = wpitch_sm; // idx 7
+  wroll_s  = wroll_sm;  // idx 8
+  acc_s    = acc_sm;    // idx 2
+  flux_n   = flux_sm;   // idx 1
+  amp_low  = alow_sm;   // idx 9
+  amp_mid  = amid_sm;   // idx10
+  amp_high = ahigh_sm;  // idx11
+  //entropy_motion = entropy_motion_sm;
+  //entropy_log2   = entropy_log2_sm;
+  
+  // jerk     = jerk_sm;
+  //entropy_n = entropy_sm; // NEW: smoothed entropy back into slider18
+);
+
+// 5) pass-through program audio on 1/2
+// (no change)
+spl0=spl0; spl1=spl1;
+
+// 6) emit DC control signals on extra channels (3..13) for Audio Control Signal modulation
+// Ensure the track has enough channels (Track I/O: set to at least 16)
+dc = out_gain;
+spl2  = vx_sm    * dc; // ch3: vx_s (smoothed)
+spl3  = vy_sm    * dc; // ch4: vy_s
+spl4  = vz_sm    * dc; // ch5: vz_s
+spl5  = wyaw_sm  * dc; // ch6: wyaw_s
+spl6  = wpitch_sm* dc; // ch7: wpitch_s
+spl7  = wroll_sm * dc; // ch8: wroll_s
+spl8  = acc_sm   * dc; // ch9: acc_s
+spl9  = flux_sm  * dc; // ch10: flux_n
+spl10 = alow_sm  * dc; // ch11: amp_low
+spl11 = amid_sm  * dc; // ch12: amp_mid
+spl12 = ahigh_sm * dc; // ch13: amp_high
+spl13 = entropy_motion_sm * dc; // ch14: motion entropy
+spl14 = entropy_log2_sm   * dc; // ch15: LoG² entropy
+
+//spl13 = entropy_sm * dc; // ch14: entropy (0..1, smoothed)
+// spl13 = jerk_sm  * dc;
+
