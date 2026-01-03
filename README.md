@@ -321,7 +321,3 @@ For the full “why” (camera motion, occlusion, smooth shading, IG-LoG/SCM, te
 
 * **TECHNICAL.md**
 
-```
-
-If you want the README to be even more bulletproof, add one line near the top: **“Press F1 in the app for the authoritative hotkey list.”** That keeps the README from drifting as you change controls. 
-```
