@@ -3399,6 +3399,115 @@ def _asym_two_sided_leak01(x01: np.ndarray, a_rel: np.ndarray) -> np.ndarray:
     rev = rev[::-1]
     return np.maximum(fwd, rev)
 
+# --- NEW: phase-conditioned release (offline) -------------------------------
+# Goal:
+#   - attack stays instant (xi >= yi => y := x)
+#   - on release, choose per-sample decay so y reaches TARGET (default 0.5)
+#     exactly at the end of the current AoI phase (next direction flip).
+#
+# This replaces "fixed/heuristic release" with "release matched to known future".
+
+FLUX_REL50_ENABLE = True
+FLUX_REL50_TARGET = 0.50          # degrade-to target at phase end
+FLUX_REL50_MIN_FR = 2             # avoid insane coefficients when phase is 0–1 frames
+FLUX_REL50_POST_BLUR_SEC = 0.030  # cosmetic only (keep tiny)
+
+def _next_flip_index_from_sign(sign_raw: np.ndarray) -> np.ndarray:
+    """
+    sign_raw: int array in {-1,0,+1} over time (already deadbanded).
+    Returns nxt[i] = index of the next "hard flip" after i (strictly > i),
+    or n if none. Flip means prev!=0 and cur!=0 and cur!=prev.
+    """
+    s = np.asarray(sign_raw, int)
+    n = int(s.size)
+    nxt = np.full(n, n, dtype=int)
+    last_change = n
+
+    # Identify flip points first (forward), then fill nxt via backward sweep.
+    flip = np.zeros(n, dtype=bool)
+    prev = int(s[0]) if n else 0
+    for i in range(1, n):
+        cur = int(s[i])
+        if prev != 0 and cur != 0 and cur != prev:
+            flip[i] = True
+        if cur != 0:
+            prev = cur
+
+    for i in range(n - 1, -1, -1):
+        if flip[i]:
+            last_change = i
+        nxt[i] = last_change
+    return nxt
+
+def flux_release_to_target_by_phase01(
+    flux01: np.ndarray,
+    entropy01: np.ndarray,
+    v_al: np.ndarray,
+    fps: float,
+    *,
+    io_in_sign: int = +1,
+    v_zero: float = V_ZERO,
+    target: float = FLUX_REL50_TARGET,
+) -> np.ndarray:
+    """
+    flux01:    0..1 base env
+    entropy01: 0..1 (used only for a residual floor, like your current leak)
+    v_al:      signed AoI velocity (same axis you use for IN/OUT)
+    """
+    f = np.asarray(flux01, np.float64)
+    e = np.asarray(entropy01, np.float64)
+    v = np.asarray(v_al, np.float64)
+
+    n = int(min(f.size, e.size, v.size))
+    if n <= 1:
+        return np.clip(f[:n], 0.0, 1.0)
+
+    f = np.clip(f[:n], 0.0, 1.0)
+    e = np.clip(e[:n], 0.0, 1.0)
+    v = v[:n]
+
+    # AoI "IN-frame" velocity (so sign flip semantics are consistent with your IN/OUT)
+    vin = float(io_in_sign) * v
+
+    # Deadbanded sign in {-1,0,+1}
+    s = np.zeros(n, dtype=int)
+    nz = np.abs(vin) >= float(v_zero)
+    s[nz] = np.sign(vin[nz]).astype(int)
+
+    # Next flip index per sample (offline lookahead)
+    nxt = _next_flip_index_from_sign(s)
+
+    # Per-sample release coefficient a[i] so that over Δ frames, the cumulative
+    # multiplier equals `target` (default 0.5).
+    # For constant a: y_end = a^Δ * y_start  => a = target^(1/Δ)
+    # Clamp Δ to avoid blow-ups.
+    a_rel = np.empty(n, np.float64)
+    tgt = float(np.clip(target, 1e-6, 0.999999))
+    for i in range(n):
+        end = int(nxt[i])
+        dfr = int(end - i)
+        if dfr < int(FLUX_REL50_MIN_FR):
+            dfr = int(FLUX_REL50_MIN_FR)
+        # a in (0,1): slower release when dfr is large
+        a_rel[i] = tgt ** (1.0 / float(dfr))
+
+    # Apply asymmetric filter: instant attack + phase-conditioned release
+    y = _asym_attack_instant_release_ema(f, a_rel)
+
+    # Keep your entropy-driven residual floor behavior (prevents "dead air" collapse)
+    # Uses the same constants you already have in the FLUX_LEAK block.
+    sig = float(max(1.0, round(float(FLUX_LEAK_FLOOR_SMOOTH_SEC) * float(fps))))
+    e_s = _gauss_blur1d(e, sig)
+    floor = float(FLUX_LEAK_FLOOR_MIN) + float(FLUX_LEAK_FLOOR_K) * np.clip(e_s, 0.0, 1.0)
+    y = np.maximum(y, floor)
+
+    # tiny cosmetic blur (do NOT use this as the real smoother)
+    sig2 = float(max(1.0, round(float(FLUX_REL50_POST_BLUR_SEC) * float(fps))))
+    y = _gauss_blur1d(y, sig2)
+
+    return np.clip(y, 0.0, 1.0)
+# --- END NEW ----------------------------------------------------------------
+
 
 def flux_leaky_shape01(flux01: np.ndarray, entropy01: np.ndarray, fps: float) -> np.ndarray:
     """
@@ -8893,9 +9002,22 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
         entropy_roi = normalize_unsigned01(_np.abs(res_ent))
 
-        # --- FLUX_LEAK: offline asymmetric wetness persistence (attack=instant, release adaptive) ---
-        if FLUX_LEAK_ENABLE:
+        # --- FLUX_SHAPE: offline, phase-conditioned release to 50% by next AoI flip ---
+        if FLUX_REL50_ENABLE:
+            flux_inner = flux_release_to_target_by_phase01(
+                flux_inner,
+                entropy_roi,
+                v_al,                 # you already computed v_al above (AoI axis velocity)
+                fps,
+                io_in_sign=int(getattr(r, "io_in_sign", +1)),
+                v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
+                target=float(FLUX_REL50_TARGET),
+            )
+        elif FLUX_LEAK_ENABLE:
+            # fallback to the older entropy-density leak model
             flux_inner = flux_leaky_shape01(flux_inner, entropy_roi, fps)
+        # --- END FLUX_SHAPE ---
+
         # --- END FLUX_LEAK ---
 
 
