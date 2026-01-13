@@ -282,6 +282,44 @@ def _vz25_global_from_flow(prev_gray: np.ndarray,
     return float(np.median(vz_map[m]))
 
 # --- END PATCH VZ25_GLOB_A ---
+def _robust01_from_u8_absdiff(a_u8: np.ndarray, b_u8: np.ndarray,
+                             p_lo: float = 10.0, p_hi: float = 90.0,
+                             blur_sigma: float = 1.0, gamma: float = 0.85) -> np.ndarray:
+    """HG-like structural motion salience:
+    absdiff on structure maps -> robust normalize -> optional blur.
+    Returns float32 in [0,1].
+    """
+    d = cv.absdiff(a_u8, b_u8).astype(np.float32)
+    if blur_sigma and blur_sigma > 0.0:
+        d = cv.GaussianBlur(d, (0, 0), float(blur_sigma))
+    lo = float(np.percentile(d, p_lo))
+    hi = float(np.percentile(d, p_hi))
+    rng = max(hi - lo, 1e-9)
+    x = np.clip((d - lo) / rng, 0.0, 1.0)
+    if gamma and gamma != 1.0:
+        x = np.power(x, float(gamma), dtype=np.float32)
+    return x.astype(np.float32)
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted median. Arrays are 1D."""
+    if values is None or weights is None:
+        return 0.0
+    v = np.asarray(values, np.float64).ravel()
+    w = np.asarray(weights, np.float64).ravel()
+    if v.size == 0 or w.size == 0 or v.size != w.size:
+        return 0.0
+    m = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
+    v = v[m]; w = w[m]
+    if v.size == 0:
+        return 0.0
+    idx = np.argsort(v)
+    v = v[idx]; w = w[idx]
+    c = np.cumsum(w)
+    cutoff = 0.5 * c[-1]
+    j = int(np.searchsorted(c, cutoff, side="left"))
+    j = max(0, min(j, v.size - 1))
+    return float(v[j])
+
 
 # --- PERF PATCH: compute Farneback once per frame, reuse for div + vz25 ---
 def _compute_flow_pack(prev_gray: np.ndarray, gray: np.ndarray, scale: float = FLOW_SCALE):
@@ -335,29 +373,65 @@ def _compute_flow_pack(prev_gray: np.ndarray, gray: np.ndarray, scale: float = F
     else:
         curv01 = np.zeros((H, W), np.float32)
 
-    return dict(fx=fx, fy=fy, vmag=vmag, curv01=curv01, H=H, W=W)
+    # HG-like structural motion salience (0..1) for weighting div/vz25:
+    # detect structure on IG-LoG map, but measure *change* (absdiff) between frames.
+    try:
+        Sprev = _struct_u8_from_gray(prev_s)
+        Scurr = _struct_u8_from_gray(curr_s)
+        hg01 = _robust01_from_u8_absdiff(Sprev, Scurr, p_lo=10.0, p_hi=90.0, blur_sigma=1.0, gamma=0.85)
+    except Exception:
+        hg01 = np.ones((H, W), np.float32)
+
+    return dict(fx=fx, fy=fy, vmag=vmag, curv01=curv01, hg01=hg01, H=H, W=W)
+
 
 def _divergence_from_pack(pack) -> float:
-    if not pack: return 0.0
+    if not pack:
+        return 0.0
     fx = pack["fx"]; fy = pack["fy"]
     mag = pack["vmag"]
+    hg01 = pack.get("hg01", None)
+
+    # original coherent gating
     mthr = np.percentile(mag, 70.0)
     mask = (mag >= mthr)
     ang  = np.arctan2(fy, fx)
     a0   = np.median(ang[mask]) if np.count_nonzero(mask) else 0.0
-    mask &= (np.cos(ang - a0) >= 0.8)  # ±36.9°
+    mask &= (np.cos(ang - a0) >= 0.8)
 
     dvx_dx = cv.Sobel(fx, cv.CV_32F, 1, 0, 3) / 8.0
     dvy_dy = cv.Sobel(fy, cv.CV_32F, 0, 1, 3) / 8.0
     div = dvx_dx + dvy_dy
+
+    # HG-guided weighting: don't change the differential math, change WHERE it's trusted.
+    if hg01 is None:
+        hg01 = np.ones_like(div, np.float32)
+    else:
+        hg01 = hg01.astype(np.float32)
+
+    m95 = float(np.percentile(mag, 95.0)) or 1e-9
+    mag01 = np.clip(mag / m95, 0.0, 1.0).astype(np.float32)
+    w = (hg01 * mag01).astype(np.float32)
+
+    mask2 = mask & (w >= 0.10)
+    if np.count_nonzero(mask2) >= 24:
+        return _weighted_median(div[mask2], w[mask2])
+
+    mask3 = (w >= 0.08)
+    if np.count_nonzero(mask3) >= 64:
+        return _weighted_median(div[mask3], w[mask3])
+
     if np.count_nonzero(mask) >= 16:
         return float(np.median(div[mask]))
     return float(np.median(div))
 
+
 def _vz25_from_pack(pack) -> float:
-    if not pack: return 0.0
+    if not pack:
+        return 0.0
     fx = pack["fx"]; fy = pack["fy"]
     curv01 = pack["curv01"]
+    hg01 = pack.get("hg01", None)
     H = int(pack["H"]); W = int(pack["W"])
 
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -374,12 +448,266 @@ def _vz25_from_pack(pack) -> float:
     m95 = float(np.percentile(vmag, 95.0)) or 1e-9
     mag01 = np.clip(vmag / m95, 0.0, 1.0)
 
-    vz_map = np.sign(v_rad) * curv01 * mag01
-    m = (vmag > 1e-6)
+    if hg01 is None:
+        hg01 = np.ones((H, W), np.float32)
+    else:
+        hg01 = hg01.astype(np.float32)
+
+    vz_map = np.sign(v_rad) * curv01 * mag01 * hg01
+
+    m = (vmag > 1e-6) & (hg01 >= 0.08)
+    if np.count_nonzero(m) < 32:
+        m = (vmag > 1e-6)
     if np.count_nonzero(m) < 32:
         return 0.0
-    return float(np.median(vz_map[m]))
+
+    w = (hg01 * mag01).astype(np.float32)
+    return _weighted_median(vz_map[m], w[m])
+
 # --- END PERF PATCH ---
+
+# ====================== Global motion backends: FB / HG / Hybrid ======================
+# FB   = existing ORB/RANSAC affine 2D estimate (current behavior)
+# HG   = IG-LoG structural phase-correlation + LK median (translation-only, robust on low texture)
+# Hybrid = soft switch between FB and HG based on confidence-weighted magnitude (no incoherent blending)
+
+# HG params (operate on FLOW_SCALE-sized frames; units are full-res px/frame after dividing by FLOW_SCALE)
+HG_PC_DOWNSCALE_GLOB = 0.5     # additional downscale for phase correlation on structural map (speed/stability)
+HG_PC_MIN_RESP_GLOB  = 0.12    # phaseCorr response gate (0..1-ish)
+HG_GFTT_MAX_CORNERS  = 260     # LK features
+HG_GFTT_QL           = 0.01
+HG_GFTT_MIN_DIST     = 7
+HG_LK_WIN            = 21
+HG_LK_MAXLEVEL       = 3
+
+HYB_ATTACK = 0.35   # how fast we switch *towards* HG when HG wins
+HYB_RELEASE = 0.18  # how fast we switch *back* towards FB
+HYB_DOT_OPPOSE = -0.15  # if direction cosine is below this, don't blend (pick winner)
+
+
+def _fb_conf_from_orb_matches(nmatch: int) -> float:
+    """Rough confidence for the existing ORB/RANSAC affine estimate (0..1)."""
+    try:
+        n = int(nmatch)
+    except Exception:
+        n = 0
+    # Below ~8 matches: basically guessy. Past ~40: "good enough".
+    return float(np.clip((n - 8.0) / 32.0, 0.0, 1.0))
+
+def _orb_struct_detect_and_compute(orb, gray_orb_u8: np.ndarray, max_kp: int = ORB_NFEATURES):
+    """Structure-guided ORB:
+    - Detect keypoints on IG-LoG structural map (more invariant to lighting / flat texture)
+    - Compute descriptors on grayscale (keeps descriptor distinctiveness)
+
+    Returns (keypoints, descriptors).
+    """
+    try:
+        struct_u8 = _struct_u8_from_gray(gray_orb_u8)
+        kps = orb.detect(struct_u8, None)
+        if not kps:
+            return [], None
+        if max_kp is not None and int(max_kp) > 0 and len(kps) > int(max_kp):
+            kps = sorted(kps, key=lambda k: float(getattr(k, "response", 0.0)), reverse=True)[:int(max_kp)]
+        kps, des = orb.compute(gray_orb_u8, kps)
+        return kps, des
+    except Exception:
+        # hard fallback to vanilla ORB
+        try:
+            return orb.detectAndCompute(gray_orb_u8, None)
+        except Exception:
+            return [], None
+
+
+def _struct_u8_from_gray(gray_u8: np.ndarray) -> np.ndarray:
+    """
+    Cheap global structural map for HG:
+      - use IG-LoG energy (already present for vz25/div) as an "edge/curvature" measure
+      - robust-normalize to 0..255
+    """
+    try:
+        E = _iglog_energy_frame(gray_u8)
+        if E is None or E.size == 0:
+            return gray_u8.astype(np.uint8)
+        lo = float(np.percentile(E, 5.0))
+        hi = float(np.percentile(E, 95.0))
+        rng = max(hi - lo, 1e-9)
+        M = np.clip((E - lo) / rng, 0.0, 1.0)
+        # gamma < 1 emphasizes weaker structure a bit (helps flat scenes)
+        M = np.power(M, 0.65, dtype=np.float32)
+        return np.clip(M * 255.0, 0, 255).astype(np.uint8)
+    except Exception:
+        return gray_u8.astype(np.uint8)
+
+
+def _phasecorr_shift(prev_u8: np.ndarray, curr_u8: np.ndarray, down: float = HG_PC_DOWNSCALE_GLOB):
+    """Return (dx, dy, resp) in *input image pixels* (not full-res)."""
+    if prev_u8 is None or curr_u8 is None:
+        return 0.0, 0.0, 0.0
+    H, W = prev_u8.shape[:2]
+    if H < 8 or W < 8:
+        return 0.0, 0.0, 0.0
+
+    d = float(np.clip(down, 0.25, 1.0))
+    if d != 1.0:
+        Wd = max(8, int(round(W * d)))
+        Hd = max(8, int(round(H * d)))
+        p = cv.resize(prev_u8, (Wd, Hd), cv.INTER_AREA)
+        c = cv.resize(curr_u8, (Wd, Hd), cv.INTER_AREA)
+    else:
+        p, c = prev_u8, curr_u8
+
+    pf = p.astype(np.float32)
+    cf = c.astype(np.float32)
+
+    try:
+        win = cv.createHanningWindow((pf.shape[1], pf.shape[0]), cv.CV_32F)
+        (dx, dy), resp = cv.phaseCorrelate(pf, cf, win)
+    except Exception:
+        # fallback without window
+        (dx, dy), resp = cv.phaseCorrelate(pf, cf)
+
+    # back to pre-downscale pixel units
+    dx = float(dx) / d
+    dy = float(dy) / d
+    return dx, dy, float(resp)
+
+
+def _hg_global_translation(prev_gray: np.ndarray, gray: np.ndarray, scale: float = FLOW_SCALE, state: Optional[dict] = None):
+    """
+    Hypergraph-ish global translation estimator.
+    Returns:
+      dx_pf, dy_pf  (full-res pixels / frame)
+      conf          (0..1)
+      dbg           (dict)
+    """
+    if prev_gray is None or gray is None:
+        return 0.0, 0.0, 0.0, {"ok": False, "why": "no_prev"}
+
+    h, w = gray.shape[:2]
+    Ws = max(8, int(round(w * float(scale))))
+    Hs = max(8, int(round(h * float(scale))))
+    if Ws < 8 or Hs < 8:
+        return 0.0, 0.0, 0.0, {"ok": False, "why": "too_small"}
+
+    prev_s = cv.resize(prev_gray, (Ws, Hs), cv.INTER_AREA)
+    curr_s = cv.resize(gray,      (Ws, Hs), cv.INTER_AREA)
+
+    # structural maps (uint8)
+    Mp = _struct_u8_from_gray(prev_s)
+    Mc = _struct_u8_from_gray(curr_s)
+
+    # phase correlation (coarse)
+    dx_pc, dy_pc, resp = _phasecorr_shift(Mp, Mc, down=HG_PC_DOWNSCALE_GLOB)
+
+    # LK refinement around the coarse shift
+    dx_lk = dy_lk = 0.0
+    lk_conf = 0.0
+    n_inl = 0
+
+    try:
+        p0 = cv.goodFeaturesToTrack(Mp, maxCorners=int(HG_GFTT_MAX_CORNERS),
+                                    qualityLevel=float(HG_GFTT_QL),
+                                    minDistance=float(HG_GFTT_MIN_DIST),
+                                    blockSize=7, useHarrisDetector=False)
+        if p0 is not None and int(p0.shape[0]) >= 8:
+            p0 = p0.astype(np.float32)
+            p1_init = p0 + np.array([[[dx_pc, dy_pc]]], dtype=np.float32)
+
+            p1, st, err = cv.calcOpticalFlowPyrLK(
+                prev_s, curr_s, p0, p1_init,
+                winSize=(int(HG_LK_WIN), int(HG_LK_WIN)),
+                maxLevel=int(HG_LK_MAXLEVEL),
+                criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 25, 0.01),
+                flags=cv.OPTFLOW_USE_INITIAL_FLOW
+            )
+            if p1 is not None and st is not None:
+                st = st.reshape(-1).astype(np.uint8)
+                good = (st == 1)
+                n_inl = int(np.count_nonzero(good))
+                if n_inl >= 8:
+                    d = (p1.reshape(-1, 2)[good] - p0.reshape(-1, 2)[good]).astype(np.float32)
+                    med = np.median(d, axis=0)
+                    dx_lk = float(med[0]); dy_lk = float(med[1])
+
+                    # coherence: how tightly displacements cluster around the median
+                    dev = np.sqrt((d[:, 0] - med[0])**2 + (d[:, 1] - med[1])**2)
+                    mad = float(np.median(dev)) if dev.size else 999.0
+
+                    # inlier fraction + spread gate
+                    frac = float(n_inl) / float(max(1, int(p0.shape[0])))
+                    spread_score = float(np.exp(-mad / 2.0))  # ~2px MAD => ~0.37
+                    lk_conf = float(np.clip(frac * spread_score, 0.0, 1.0))
+    except Exception:
+        pass
+
+    # fuse: if LK looks reliable, prefer it; else keep phaseCorr
+    use_lk = (lk_conf >= 0.18 and n_inl >= 10)
+    if use_lk:
+        # small blend keeps phaseCorr bias helpful on huge steps
+        w_lk = float(np.clip(0.65 + 0.35 * lk_conf, 0.65, 0.95))
+        dx_s = (1.0 - w_lk) * dx_pc + w_lk * dx_lk
+        dy_s = (1.0 - w_lk) * dy_pc + w_lk * dy_lk
+    else:
+        dx_s, dy_s = dx_pc, dy_pc
+
+    # confidence: mix phaseCorr response + LK coherence
+    conf = float(np.clip(0.60 * np.clip(resp, 0.0, 1.0) + 0.40 * lk_conf, 0.0, 1.0))
+
+    # hard gate: totally untrusted phaseCorr response and no LK
+    if resp < float(HG_PC_MIN_RESP_GLOB) and lk_conf < 0.15:
+        conf *= 0.35
+
+    dx_pf = float(dx_s) * (1.0 / float(scale))
+    dy_pf = float(dy_s) * (1.0 / float(scale))
+
+    dbg = {"ok": True, "resp": float(resp), "lk_conf": float(lk_conf), "n_inl": int(n_inl),
+           "dx_s": float(dx_s), "dy_s": float(dy_s)}
+    return dx_pf, dy_pf, conf, dbg
+
+
+def _hybrid_blend_step(alpha_prev: float,
+                       fb_dx: float, fb_dy: float, fb_conf: float,
+                       hg_dx: float, hg_dy: float, hg_conf: float) -> Tuple[float, float, float, dict]:
+    """
+    Hybrid = choose "the moving one" (confidence-weighted magnitude), but soft-switch to avoid flicker.
+    Returns (dx, dy, alpha, dbg), where alpha is HG weight.
+    """
+    fb_dx = float(fb_dx); fb_dy = float(fb_dy)
+    hg_dx = float(hg_dx); hg_dy = float(hg_dy)
+    fb_conf = float(np.clip(fb_conf, 0.0, 1.0))
+    hg_conf = float(np.clip(hg_conf, 0.0, 1.0))
+
+    mag_fb = float(math.hypot(fb_dx, fb_dy))
+    mag_hg = float(math.hypot(hg_dx, hg_dy))
+
+    # score = magnitude * confidence (with a small floor so tiny conf doesn't kill everything)
+    score_fb = mag_fb * (0.20 + 0.80 * fb_conf)
+    score_hg = mag_hg * (0.20 + 0.80 * hg_conf)
+
+    # direction agreement
+    dot = fb_dx * hg_dx + fb_dy * hg_dy
+    cos = float(dot / (mag_fb * mag_hg + 1e-9)) if (mag_fb > 1e-9 and mag_hg > 1e-9) else 1.0
+
+    if cos <= float(HYB_DOT_OPPOSE):
+        target = 1.0 if (score_hg >= score_fb) else 0.0  # avoid incoherent cancellation
+    else:
+        target = float(score_hg / (score_hg + score_fb + 1e-9))
+
+    a = float(np.clip(alpha_prev, 0.0, 1.0))
+    rate = float(HYB_ATTACK if target > a else HYB_RELEASE)
+    a = a + rate * (target - a)
+    a = float(np.clip(a, 0.0, 1.0))
+
+    dx = (1.0 - a) * fb_dx + a * hg_dx
+    dy = (1.0 - a) * fb_dy + a * hg_dy
+
+    dbg = {"alpha": a, "target": target, "cos": cos,
+           "mag_fb": mag_fb, "mag_hg": mag_hg,
+           "score_fb": score_fb, "score_hg": score_hg}
+    return float(dx), float(dy), a, dbg
+
+# ==================== End global motion backends ====================
+
 
 
 # ---------- Robust normalizer (per-axis; MAD + percentile + gamma) ----------
@@ -1156,9 +1484,33 @@ class Analyzer:
         self.orb = cv.ORB_create(nfeatures=ORB_NFEATURES, scaleFactor=1.2, nlevels=8, edgeThreshold=16, patchSize=31, fastThreshold=7)
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
 
+        self._burnin_frames = int(float(getattr(self.args, "burnin_sec", 2.0)) * self.fps)
+        self._frame_i = 0
+        self._did_restart = False
+
+
         self.rows: List[FrameRow] = []
         self.g_trans=[]; self.g_rot2d=[]; self.g_roll=[]; self.g_parax=[]
         self._ov_hist = {}
+
+        # global motion backend (translation/pose split):
+        #   Hybrid (default): HG provides dx/dy; ORB provides rot/scale + 3D correspondences (no competition on translation)
+        #   ORB:  ORB provides dx/dy + rot/scale (+3D)
+        #   HG:   HG provides dx/dy only (pose neutral)
+        mm = str(getattr(self.args, "mode", "Hybrid") or "Hybrid").strip().lower()
+        if mm in ("fb", "feature", "features", "orb"):
+            mm = "orb"
+        elif mm in ("hyb", "hybrid", "mix"):
+            mm = "hybrid"
+        elif mm in ("hg", "hypergraph"):
+            mm = "hg"
+        else:
+            mm = "hybrid"
+        self.motion_mode = mm
+        self._hg_state: dict = {}
+
+        self._hyb_alpha = 0.0
+        self._hg_state: dict = {}
         self.write_annotated = bool(write_annotated); self.show_window = bool(show_window)
         self.outW = even2(self.W); self.outH = even2(self.H + HUD_BAND_H + GRAPH_H)
         stem = self.path.stem
@@ -1205,7 +1557,8 @@ class Analyzer:
         self._orb_sx = ow / float(oW)
         self._orb_sy = oh / float(oH)
         prev_orb = cv.resize(self.prev_gray, (oW, oH), cv.INTER_AREA) if ORB_SCALE != 1.0 else self.prev_gray
-        self.kp_prev, self.des_prev = self.orb.detectAndCompute(prev_orb, None)  # cache
+        self.kp_prev, self.des_prev = _orb_struct_detect_and_compute(self.orb, prev_orb, max_kp=ORB_NFEATURES)  # cache
+
 
         self._fq = Queue(maxsize=8)
         self.dup_flags: List[bool] = []  # per-frame duplicate flags aligned with rows
@@ -1295,7 +1648,7 @@ class Analyzer:
         sx = ow / float(oW)
         sy = oh / float(oH)
         orb_img = cv.resize(gray, (oW, oH), cv.INTER_AREA) if ORB_SCALE != 1.0 else gray
-        kp2, des2 = self.orb.detectAndCompute(orb_img, None)
+        kp2, des2 = _orb_struct_detect_and_compute(self.orb, orb_img, max_kp=ORB_NFEATURES)
         if self.des_prev is None or des2 is None:
             self.kp_prev, self.des_prev = kp2, des2
             return 0.0, 0.0, 0.0, 1.0, 0, None, None
@@ -1521,6 +1874,7 @@ class Analyzer:
         item = self._fq.get()
         if item is None:
             return False, self.frame_idx, None, None, None
+            
         frame = item
         gray  = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
@@ -1555,7 +1909,26 @@ class Analyzer:
             curv_val = frame_curvature(self.prev_gray, gray, scale=FLOW_SCALE)
             vz25_raw = _vz25_from_pack(pack)
 
-            dx, dy, rot2d, scale2d, nmatch, pts1, pts2 = self.estimate_2d_cached(gray)
+            # --- global motion backend: HG translation + optional ORB pose ---
+            dx_hg, dy_hg, hg_conf, _hg_dbg = _hg_global_translation(
+                self.prev_gray, gray, scale=FLOW_SCALE, state=self._hg_state
+            )
+
+            if self.motion_mode == "hg":
+                # HG-only: translation-only, pose neutral (fastest)
+                dx, dy = dx_hg, dy_hg
+                rot2d, scale2d, nmatch, pts1, pts2 = 0.0, 1.0, 0, None, None
+            else:
+                # ORB or Hybrid: run ORB (structure-guided) to get pose + 3D correspondences
+                dx_orb, dy_orb, rot2d, scale2d, nmatch, pts1, pts2 = self.estimate_2d_cached(gray)
+
+                if self.motion_mode == "orb":
+                    # ORB-only: translation+pose from ORB affine
+                    dx, dy = dx_orb, dy_orb
+                else:
+                    # HYBRID (default agreement): HG owns translation; ORB supplies pose only
+                    dx, dy = dx_hg, dy_hg
+
             trans_mag = float(math.hypot(dx, dy))
             (E_inl, H_inl, parallax,
             yaw, pitch, roll, tx, ty, tz, tnorm) = self.estimate_3d_parallax(pts1, pts2)
@@ -1669,6 +2042,7 @@ class Analyzer:
             self._sxy_lock = self._sxy_running
         sxy_firstpass = self._sxy_lock if self._sxy_lock is not None else self._sxy_running
 
+        
         # overlay on video
         gui = frame.copy()
         sxy_firstpass = self.sxy_dim
@@ -1684,7 +2058,7 @@ class Analyzer:
                 over = dbg_col.astype(np.float32)
                 gui = (base * (1.0 - a) + over * a).astype(np.uint8)
 
-
+        
         # output frame (video + HUD + graph)
         out = np.vstack([gui, band, graph])
 
@@ -2182,7 +2556,11 @@ def build_arg_parser():
     ap.add_argument("--vz25-mix", type=float, default=0.70,
                     help="Blend factor when vz-mode='hybrid' (0=all divergence, 1=all 2.5D curvature)")
     
-    # Robust export (two-pass)
+        # global XY motion backend (dx/dy)
+    ap.add_argument("--mode", choices=["ORB","HG","Hybrid"], default="Hybrid",
+                    help="Global motion backend for dx/dy: FB=feature-based ORB affine (default), HG=IG-LoG structural phaseCorr+LK, Hybrid=soft-switch between FB/HG")
+
+# Robust export (two-pass)
     ap.add_argument("--no-robust-export", action="store_true", help="Disable second-pass robust annotated export")
     ap.add_argument("--robust-z", type=float, default=6.0, help="MAD z-score threshold to drop spikes for normalization")
     ap.add_argument("--robust-prctl", type=float, default=95.0, help="Percentile for arrow scaling after outlier cull (e.g., 95)")
@@ -2191,6 +2569,11 @@ def build_arg_parser():
     # Live overlay controls
     ap.add_argument("--live-lp-hz", type=float, default=None, help="Low-pass (Hz) for *live* overlay smoothing; default = profile lp_vel_hz")
     ap.add_argument("--v3-lock-s", type=float, default=1.0, help="Seconds before locking XY scale for 3D vector in first pass")
+
+    # Burn-in smoothing / filtering
+    ap.add_argument("--restart-after-burnin", type=int, default=1,
+                help="After burn-in, reset running filters/alphas and start output fresh (1=yes,0=no).")
+
     return ap
 
 def resolve_profile(args):
@@ -2208,7 +2591,7 @@ def resolve_profile(args):
     else:
         base.update(dict(pos_dead=0.15, pos_lp_hz=0.25, pos_bias_tau_s=15.0, pos_burst_gain=0.5))
     # pass-throughs
-    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix"):
+    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix","mode"):
         base[k] = getattr(args, k)
     base["robust_export"] = not getattr(args, "no_robust_export", False)
     for k in ("robust_z","robust_prctl","robust_gamma"): base[k] = getattr(args, k)
