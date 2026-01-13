@@ -572,6 +572,36 @@ def _phasecorr_shift(prev_u8: np.ndarray, curr_u8: np.ndarray, down: float = HG_
     return dx, dy, float(resp)
 
 
+
+def _cut_struct_phasecorr(prev_gray: np.ndarray, gray: np.ndarray,
+                          scale: float = FLOW_SCALE) -> Tuple[float, float]:
+    """Hard-cut detector using STRUCTURE (IG-LoG map) + phase correlation.
+
+    Returns:
+      resp : phase correlation peak response (higher = more consistent)
+      ad01 : mean absdiff on structural maps, normalized to [0,1]
+    """
+    if prev_gray is None or gray is None:
+        return 1.0, 0.0
+    h, w = gray.shape[:2]
+    W = max(8, int(round(w * float(scale))))
+    H = max(8, int(round(h * float(scale))))
+    prev_s = cv.resize(prev_gray, (W, H), cv.INTER_AREA)
+    curr_s = cv.resize(gray,      (W, H), cv.INTER_AREA)
+
+    Mp = _struct_u8_from_gray(prev_s)
+    Mc = _struct_u8_from_gray(curr_s)
+
+    # structural change magnitude
+    ad01 = float(np.mean(cv.absdiff(Mp, Mc))) / 255.0
+
+    # structural phase correlation response
+    _dx, _dy, resp = _phasecorr_shift(Mp, Mc, down=HG_PC_DOWNSCALE_GLOB)
+    resp = float(resp)
+    if not np.isfinite(resp):
+        resp = 0.0
+    return resp, ad01
+
 def _hg_global_translation(prev_gray: np.ndarray, gray: np.ndarray, scale: float = FLOW_SCALE, state: Optional[dict] = None):
     """
     Hypergraph-ish global translation estimator.
@@ -1488,6 +1518,8 @@ class Analyzer:
         self._frame_i = 0
         self._did_restart = False
 
+        self._cut_hold = 0
+
 
         self.rows: List[FrameRow] = []
         self.g_trans=[]; self.g_rot2d=[]; self.g_roll=[]; self.g_parax=[]
@@ -1879,6 +1911,90 @@ class Analyzer:
         gray  = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
         time_s = self.frame_idx / self.fps
+
+        # --- HARD CUT DETECTION (structure phaseCorr) ---
+        cut_now = False
+        try:
+            if self.prev_gray is not None:
+                resp, ad01 = _cut_struct_phasecorr(self.prev_gray, gray, scale=FLOW_SCALE)
+                resp_th = float(getattr(self.args, "cut_resp_thresh", 0.08))
+                ad_th   = float(getattr(self.args, "cut_absdiff_thresh", 0.18))
+                cut_now = (resp < resp_th) and (ad01 >= ad_th)
+                if cut_now:
+                    self._cut_hold = int(getattr(self.args, "cut_hold_frames", 2))
+        except Exception:
+            cut_now = False
+
+        if self._cut_hold > 0:
+            # Hold for N frames after cut: emit neutral motion and reset output-facing smoothers
+            self._cut_hold -= 1
+            self.dup_flags.append(False)
+
+            dx = dy = 0.0
+            rot2d, scale2d = 0.0, 1.0
+            trans_mag = 0.0
+            yaw = pitch = roll = 0.0
+            tx = ty = tz = 0.0
+            tnorm = 0.0
+            parallax = 0.0
+            divz = 0.0
+            curv_val = 0.0
+            vz25_raw = 0.0
+            nmatch = 0
+            pts1 = pts2 = None
+
+            row = FrameRow(frame=self.frame_idx, time=time_s,
+                        dx=dx, dy=dy, rot2d_deg=rot2d, scale2d=scale2d, trans_mag=trans_mag,
+                        yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll,
+                        tx=tx, ty=ty, tz=tz, tnorm=tnorm,
+                        orb_matches=nmatch,
+                        E_inliers=0, H_inliers=0, parallax=parallax,
+                        divz=float(divz), curv=float(curv_val), vz25=float(vz25_raw))
+            self.rows.append(row)
+
+            # Reset output-facing state so normalization doesn't get poisoned
+            self._live_initialized = False
+            self.vx_live = self.vy_live = self.vz_live = 0.0
+            self._ov_hist = {}
+
+            # Re-seed ORB cache on the new scene (pose becomes meaningful again after the cut)
+            try:
+                oh, ow = gray.shape[:2]
+                oW = max(32, int(round(ow * ORB_SCALE)))
+                oH = max(32, int(round(oh * ORB_SCALE)))
+                prev_orb = cv.resize(gray, (oW, oH), cv.INTER_AREA) if ORB_SCALE != 1.0 else gray
+                self.kp_prev, self.des_prev = _orb_struct_detect_and_compute(self.orb, prev_orb, max_kp=ORB_NFEATURES)
+            except Exception:
+                self.kp_prev, self.des_prev = [], None
+
+            # Advance state
+            self.prev_gray = gray
+            self.frame_idx += 1
+
+            # HUD / overlay for neutral frame (still writes annotated video if enabled)
+            band = np.full((HUD_BAND_H, self.W, 3), (25,25,25), np.uint8)
+            ytxt = 24
+            draw_text(band, f"{self.path.name}  {self.W}x{self.H}@{self.fps:.2f}  f {self.frame_idx}/{self.N}  t {time_s:7.3f}s", ytxt); ytxt+=22
+            draw_text(band, f"2D: dx={dx:+6.2f} dy={dy:+6.2f} rot2d={rot2d:+6.2f}° scale={scale2d:0.4f} |T|={trans_mag:6.2f}", ytxt, (200,255,200)); ytxt+=20
+            draw_text(band, f"3D: yaw={yaw:+6.2f}° pitch={pitch:+6.2f}° roll={roll:+6.2f}° t=({tx:+.2f},{ty:+.2f},{tz:+.2f}) para={parallax:0.3f}", ytxt, (200,220,255))
+
+            self.g_trans.append(trans_mag); self.g_rot2d.append(abs(rot2d)); self.g_roll.append(abs(roll)); self.g_parax.append(parallax)
+            for b in (self.g_trans, self.g_rot2d, self.g_roll, self.g_parax):
+                if len(b) > GRAPH_HISTORY_W: del b[0]
+            graph = self.draw_graph_strip(self.W)
+
+            gui = frame.copy()
+            self.draw_overlay_symbols(gui, 0.0, 0.0, 0.0, 0.0, normalizer=None, sxy_pixels=self.sxy_dim)
+            out = np.vstack([gui, band, graph])
+            if out.shape[1] != self.outW or out.shape[0] != self.outH:
+                out = cv.resize(out, (self.outW, self.outH), cv.INTER_AREA)
+            if self.vw is not None: self.vw.write(out)
+            if self.show_window: cv.imshow("Camera Analyzer v5F", out)
+
+            metrics = dict(frame=self.frame_idx-1, t=time_s,
+                        dx=dx, dy=dy, yaw=yaw, rot2d=rot2d, trans=trans_mag, cut=int(cut_now))
+            return True, self.frame_idx-1, gui, row, metrics
+
 
         # --- DUP: detect once and reuse ---
         is_dup = is_near_duplicate_frame(self.prev_gray, gray, DUP_FRAME_MAD_THRESH)
@@ -2571,8 +2687,20 @@ def build_arg_parser():
     ap.add_argument("--v3-lock-s", type=float, default=1.0, help="Seconds before locking XY scale for 3D vector in first pass")
 
     # Burn-in smoothing / filtering
+
+    ap.add_argument("--burnin-sec", type=float, default=2.0,
+                help="Warm up internal motion/normalization stats for N seconds, then discard those frames and start outputs fresh.")
     ap.add_argument("--restart-after-burnin", type=int, default=1,
                 help="After burn-in, reset running filters/alphas and start output fresh (1=yes,0=no).")
+
+    # Hard-cut detection (structural phase correlation)
+    ap.add_argument("--cut-resp-thresh", type=float, default=0.08,
+                help="Hard cut if structural phaseCorr response falls below this (0..1-ish). Lower = less sensitive.")
+    ap.add_argument("--cut-absdiff-thresh", type=float, default=0.18,
+                help="Hard cut if structural mean absdiff exceeds this (0..1). Higher = less sensitive.")
+    ap.add_argument("--cut-hold-frames", type=int, default=2,
+                help="After detecting a cut, output neutral lanes for N frames and reset output-facing smoothers.")
+
 
     return ap
 
@@ -2591,7 +2719,7 @@ def resolve_profile(args):
     else:
         base.update(dict(pos_dead=0.15, pos_lp_hz=0.25, pos_bias_tau_s=15.0, pos_burst_gain=0.5))
     # pass-throughs
-    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix","mode"):
+    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix","mode","burnin_sec","restart_after_burnin","cut_resp_thresh","cut_absdiff_thresh","cut_hold_frames"):
         base[k] = getattr(args, k)
     base["robust_export"] = not getattr(args, "no_robust_export", False)
     for k in ("robust_z","robust_prctl","robust_gamma"): base[k] = getattr(args, k)
