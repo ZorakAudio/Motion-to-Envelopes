@@ -1069,6 +1069,43 @@ CMAT_MIN_H = 64           # avoid absurdly tiny
 CMAT_FB_LEVELS = 5
 CMAT_FB_WINSIZE = 21
 
+
+# ---------- CMAT helpers: structural salience + weighted pooling ----------
+def _robust01_from_u8_absdiff(a_u8: np.ndarray, b_u8: np.ndarray,
+                             p_lo: float = 10.0, p_hi: float = 90.0,
+                             blur_sigma: float = 1.0, gamma: float = 0.85) -> np.ndarray:
+    """Absdiff(a,b) -> robust normalize -> [0,1] float32.
+    Used as a low-context 'HG-like' salience map for camera drift estimation.
+    """
+    d = cv.absdiff(a_u8.astype(np.uint8), b_u8.astype(np.uint8)).astype(np.float32)
+    if blur_sigma and blur_sigma > 0.0:
+        d = cv.GaussianBlur(d, (0, 0), float(blur_sigma))
+    lo = float(np.percentile(d, float(p_lo)))
+    hi = float(np.percentile(d, float(p_hi)))
+    rng = max(hi - lo, 1e-9)
+    x = np.clip((d - lo) / rng, 0.0, 1.0)
+    if gamma and gamma != 1.0:
+        x = np.power(x, float(gamma), dtype=np.float32)
+    return x.astype(np.float32)
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted median (robust). values/weights are 1D-compatible."""
+    v = np.asarray(values, np.float64).reshape(-1)
+    w = np.asarray(weights, np.float64).reshape(-1)
+    if v.size == 0 or w.size == 0 or v.size != w.size:
+        return 0.0
+    m = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
+    v = v[m]; w = w[m]
+    if v.size == 0:
+        return 0.0
+    idx = np.argsort(v)
+    v = v[idx]; w = w[idx]
+    c = np.cumsum(w)
+    cutoff = 0.5 * c[-1]
+    j = int(np.searchsorted(c, cutoff, side="left"))
+    j = max(0, min(j, v.size - 1))
+    return float(v[j])
+# -------------------------------------------------------------------------
 ARROW_SCALE = 2.0
 FLOW_PYR_LEVELS_DEFAULT = 2  # 1 = off (old behavior); >1 = external pyramid
 
@@ -5536,6 +5573,24 @@ class DeformTracker:
         fy = flow[...,1].astype(np.float32)
 
         mag = np.sqrt(fx*fx + fy*fy)
+
+        # ---------------- CMAT STRUCTURAL SALIENCE (HG-style weighting) ----------------
+        # Goal: camera drift should be estimated from "background-like" pixels that are
+        # (a) low-motion, (b) structurally meaningful, and (c) actually changed structurally.
+        #
+        # We do NOT replace Farnebäck here (we still need a smooth metric field).
+        # We only change WHERE we trust it by building a structural-change weight hg01 in [0,1].
+        hg01 = None
+        if bool(CMAT_STRUCT_MODE):
+            try:
+                st = self.__dict__.setdefault("_cmat_struct_state", {})
+                Mp = struct_M_from_gray_u8(prev_s, st)   # uint8 preferred (GSCM/IG-LoG hybrid)
+                Mc = struct_M_from_gray_u8(curr_s, st)
+                hg01 = _robust01_from_u8_absdiff(Mp, Mc, p_lo=10.0, p_hi=90.0, blur_sigma=1.0, gamma=0.85)
+            except Exception:
+                hg01 = None
+        # ------------------------------------------------------------------------------
+
         thr = float(np.percentile(mag, float(CMAT_BG_MAG_PCTL)))
         cand = (mag <= thr)
 
@@ -5544,6 +5599,15 @@ class DeformTracker:
         if rois is not None:
             fg = self._cmat_fg_union_mask_small(rois, scale, prev_s.shape[0], prev_s.shape[1], pad_px=16)
             cand &= (~fg)
+
+        # Optional structure gate (prefer pixels with reliable structure)
+        if bool(CMAT_STRUCT_MODE) and float(CMAT_BG_CURV_GATE) > 0.0:
+            try:
+                maps_p = iglog_struct_maps_gray_u8(prev_s, sigma=float(CMAT_IGLOG_SIGMA))
+                curv01 = maps_p["abs"].astype(np.float32) / 255.0
+                cand &= (curv01 >= float(CMAT_BG_CURV_GATE))
+            except Exception:
+                pass
 
         if int(np.count_nonzero(cand)) < int(CMAT_BG_MIN_PIXELS):
             cand = None
@@ -5562,14 +5626,84 @@ class DeformTracker:
             if int(np.count_nonzero(cand)) < 64:
                 cand = None
 
+        # ---------------- Weighted consensus estimate (structural + motion weights) ----------------
+        # weights = hg01 * mag01, so:
+        #  - hg01 suppresses pixels with no structural correspondence/change (lighting junk, flats)
+        #  - mag01 suppresses near-zero vectors (angle undefined; reduces "direction flip" jitter)
+        w = None
+        if hg01 is not None:
+            try:
+                m95 = float(np.percentile(mag, 95.0)) or 1e-9
+                mag01 = np.clip(mag / m95, 0.0, 1.0).astype(np.float32)
+                w = (hg01.astype(np.float32) * mag01).astype(np.float32)
+            except Exception:
+                w = None
 
-        vx_med, vy_med = _consensus_median(fx, fy, cand, cone_deg=25.0)
+        # Build a consensus inlier mask (same spirit as _consensus_median), then weighted-median inside it.
+        if cand is None:
+            base = np.ones_like(mag, dtype=bool)
+        else:
+            base = cand
 
-        # divergence (optional)
+        inl = base
+        try:
+            fx1 = fx[inl].reshape(-1)
+            fy1 = fy[inl].reshape(-1)
+            if fx1.size >= 64:
+                m = np.sqrt(fx1*fx1 + fy1*fy1)
+                nz = m > (0.02 * (float(np.percentile(m, 95.0)) + 1e-9))
+                if np.count_nonzero(nz) >= 64:
+                    ang = np.arctan2(fy1[nz], fx1[nz])
+                    B = 36
+                    bins = ((ang + np.pi) * (B / (2*np.pi))).astype(np.int32)
+                    bins = np.clip(bins, 0, B-1)
+                    hist = np.bincount(bins, minlength=B)
+                    k = int(np.argmax(hist))
+                    a0 = (((k + 0.5) * (2*np.pi/B)) - np.pi)
+                    cone = float(np.radians(25.0))
+                    d = np.arctan2(np.sin(ang - a0), np.cos(ang - a0))
+                    # rebuild inlier mask in full image coords
+                    tmp = np.zeros_like(inl, dtype=bool)
+                    idx = np.where(inl.reshape(-1))[0]
+                    idx_nz = idx[nz]
+                    tmp.reshape(-1)[idx_nz] = (np.abs(d) <= cone)
+                    if int(np.count_nonzero(tmp)) >= 32:
+                        inl = tmp
+        except Exception:
+            pass
+
+        if w is not None and int(np.count_nonzero(inl)) >= 32:
+            try:
+                ww = w[inl]
+                if float(np.sum(ww)) > 1e-6:
+                    vx_med = _weighted_median(fx[inl], ww)
+                    vy_med = _weighted_median(fy[inl], ww)
+                else:
+                    vx_med = float(np.median(fx[inl]))
+                    vy_med = float(np.median(fy[inl]))
+            except Exception:
+                vx_med = float(np.median(fx[inl]))
+                vy_med = float(np.median(fy[inl]))
+        else:
+            vx_med, vy_med = _consensus_median(fx, fy, cand, cone_deg=25.0)
+
+        # divergence (optional): weight the same inliers when possible
         dvx_dx = cv.Sobel(fx, cv.CV_32F, 1, 0, ksize=3) / 8.0
         dvy_dy = cv.Sobel(fy, cv.CV_32F, 0, 1, ksize=3) / 8.0
         div = dvx_dx + dvy_dy
-        vz_med = float(np.median(div)) if cand is None else float(np.median(div[cand]))
+
+        if w is not None and int(np.count_nonzero(inl)) >= 32:
+            try:
+                ww = w[inl]
+                if float(np.sum(ww)) > 1e-6:
+                    vz_med = _weighted_median(div[inl], ww)
+                else:
+                    vz_med = float(np.median(div[inl]))
+            except Exception:
+                vz_med = float(np.median(div[inl]))
+        else:
+            vz_med = float(np.median(div)) if cand is None else float(np.median(div[cand]))
+        # -------------------------------------------------------------------------------------------
 
         # rescale from CMAT pixels back to full-res pixels
         inv = 1.0 / max(1e-9, scale)
