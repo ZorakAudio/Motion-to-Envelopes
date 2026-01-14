@@ -295,6 +295,54 @@ def _parse_cli_ai(argv: List[str]) -> AIConfig:
     return cfg
 
 
+
+def _parse_cli_export(argv: List[str]) -> Dict[str, Any]:
+    """Parse export-related flags (kept lightweight; no argparse).
+    Flags:
+      --export-motion [live|raw]            (default: live)
+      --export-live-lp-hz <float>           (default: 0.0 = no extra LPF beyond live tracker)
+      --export-live-deadband-ps <float>     (default: 0.0)
+    """
+    cfg: Dict[str, Any] = {
+        "export_motion": "live",
+        "export_live_lp_hz": 0.0,
+        "export_live_deadband_ps": 0.0,
+    }
+
+    if "--export-motion" in argv:
+        try:
+            i = argv.index("--export-motion")
+            if i + 1 < len(argv) and not argv[i+1].startswith("--"):
+                m = str(argv[i+1]).strip().lower()
+                if m in ("live", "raw"):
+                    cfg["export_motion"] = m
+        except Exception:
+            pass
+
+    if "--export-live-lp-hz" in argv:
+        try:
+            i = argv.index("--export-live-lp-hz")
+            if i + 1 < len(argv) and not argv[i+1].startswith("--"):
+                cfg["export_live_lp_hz"] = float(argv[i+1])
+        except Exception:
+            pass
+
+    if "--export-live-deadband-ps" in argv:
+        try:
+            i = argv.index("--export-live-deadband-ps")
+            if i + 1 < len(argv) and not argv[i+1].startswith("--"):
+                cfg["export_live_deadband_ps"] = float(argv[i+1])
+        except Exception:
+            pass
+
+    cfg["export_motion"] = str(cfg.get("export_motion") or "live").lower()
+    if cfg["export_motion"] not in ("live", "raw"):
+        cfg["export_motion"] = "live"
+    cfg["export_live_lp_hz"] = float(max(0.0, cfg.get("export_live_lp_hz", 0.0) or 0.0))
+    cfg["export_live_deadband_ps"] = float(max(0.0, cfg.get("export_live_deadband_ps", 0.0) or 0.0))
+    return cfg
+
+
 def _qt_sanitize_argv(full_argv: List[str]) -> List[str]:
     """
     Qt can complain about unknown flags. Strip our app-specific flags before passing argv to QApplication.
@@ -311,6 +359,9 @@ def _qt_sanitize_argv(full_argv: List[str]) -> List[str]:
         "--ai-model-nano",
         "--ai-model-mini",
         "--ai-model-heavy",
+        "--export-motion",
+        "--export-live-lp-hz",
+        "--export-live-deadband-ps",
     }
     # boolean flags
     bool_flags = {
@@ -7238,6 +7289,24 @@ def _ema(x, alpha):
     for i in range(1, len(x)): y[i] = alpha*x[i] + (1.0-alpha)*y[i-1]
     return y
 
+
+def _ema_lp_hz(x, fps: float, lp_hz: float):
+    """First-order low-pass on a series in physical units (px/s).
+    lp_hz<=0 -> no-op.
+    """
+    x = _np.asarray(x, _np.float64)
+    if x.size == 0:
+        return x
+    hz = float(lp_hz)
+    if hz <= 0.0:
+        return x
+    a = math.exp(-(2.0 * math.pi * hz) / max(1e-6, float(fps)))
+    y = _np.empty_like(x, dtype=_np.float64)
+    y[0] = float(x[0])
+    for i in range(1, len(x)):
+        y[i] = a * y[i-1] + (1.0 - a) * float(x[i])
+    return y
+
 def leaky_integrate(x, dt, tau_ms=800):
     x = _np.asarray(x, _np.float64)
     y = _np.zeros_like(x, _np.float64)
@@ -8729,7 +8798,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -8947,11 +9016,34 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
         speed_ref = _np.sqrt(vx*vx + vy*vy + vz*vz)
 
-        vx_s = robust_smooth_adaptive(vx, fps, speed_ref=speed_ref)
-        vy_s = robust_smooth_adaptive(vy, fps, speed_ref=speed_ref)
-        vz_s = robust_smooth_adaptive(vz, fps, speed_ref=speed_ref,
-                                    slow_win_ms=160, slow_ema_ms=240,
-                                    fast_win_ms=24,  fast_ema_ms=40)
+        # -------- export motion selection (match HUD arrows) --------
+        em = str(export_motion or "live").lower()
+        if em == "live":
+            # use recorded live velocities (already inertia-shaped in update_roi)
+            vx_s = _np.asarray(vx, _np.float64)
+            vy_s = _np.asarray(vy, _np.float64)
+            vz_s = _np.asarray(vz, _np.float64)
+
+            # optional extra low-pass (default 0.0)
+            if float(export_live_lp_hz) > 0.0:
+                vx_s = _ema_lp_hz(vx_s, fps, float(export_live_lp_hz))
+                vy_s = _ema_lp_hz(vy_s, fps, float(export_live_lp_hz))
+                vz_s = _ema_lp_hz(vz_s, fps, float(export_live_lp_hz))
+
+            # optional deadband -> decay-to-zero feel
+            db = float(export_live_deadband_ps)
+            if db > 0.0:
+                vx_s = _np.where(_np.abs(vx_s) < db, 0.0, vx_s)
+                vy_s = _np.where(_np.abs(vy_s) < db, 0.0, vy_s)
+                vz_s = _np.where(_np.abs(vz_s) < db, 0.0, vz_s)
+        else:
+            # legacy: additional robust smoothing (can smear + bias)
+            vx_s = robust_smooth_adaptive(vx, fps, speed_ref=speed_ref)
+            vy_s = robust_smooth_adaptive(vy, fps, speed_ref=speed_ref)
+            vz_s = robust_smooth_adaptive(vz, fps, speed_ref=speed_ref,
+                                        slow_win_ms=160, slow_ema_ms=240,
+                                        fast_win_ms=24,  fast_ema_ms=40)
+        # -------------------------------------------------------------
 
         ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
         jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
@@ -9155,7 +9247,12 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         # --- END FLUX_LEAK ---
 
 
-        dirx11_pc, diry11_pc, dirz11_pc = per_cycle_dir_gauss_blend11(vx_s, vy_s, vz_s, vP, fps)
+        if str(export_motion or 'live').lower() == 'live':
+            dirx11_pc = _dir11(vx_s, 1.0)
+            diry11_pc = _dir11(vy_s, 1.0)
+            dirz11_pc = _dir11(vz_s, 1.0)
+        else:
+            dirx11_pc, diry11_pc, dirz11_pc = per_cycle_dir_gauss_blend11(vx_s, vy_s, vz_s, vP, fps)
         # dirz11_s = _dir11(vz_s, 1.0)  # direction Z
         pz_s = leaky_integrate(vz_s, dt, tau_ms=int(getattr(r, 'posz_tau_ms', 800)))
         posz01_s = normalize_unsigned01(pz_s)
@@ -9675,6 +9772,7 @@ def run_qt(video_path):
     assert QtWidgets is not None, "PySide6 not installed. pip install PySide6"
     argv_tail = sys.argv[2:]
     _parse_cli_scale(argv_tail)  # reuse your scale parser
+    export_cfg = _parse_cli_export(argv_tail)
     ai_cfg = _parse_cli_ai(argv_tail)
     if ai_cfg.enabled and ai_cfg.require_policy_ack and not ai_cfg.policy_ack:
         # Print once on startup; actual API calls remain disabled until ack flag is present.
@@ -10889,7 +10987,10 @@ def run_qt(video_path):
         def export_scene(self, si):
             if si<0 or si>=len(self.scenes): return
             sc = self.scenes[si]
-            csv_path = save_scene_csv_and_push(video_path, si, sc, self.fps, self.W, self.H, robust_gamma=1.0, push=True)
+            csv_path = save_scene_csv_and_push(video_path, si, sc, self.fps, self.W, self.H, robust_gamma=1.0, push=True,
+                                            export_motion=str(export_cfg.get('export_motion','live')),
+                                            export_live_lp_hz=float(export_cfg.get('export_live_lp_hz',0.0)),
+                                            export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps',0.0)))
             # Optional: AI sidecar inference on export (does NOT change the CSV schema)
             if self.ai_cfg.enabled and self.ai_cfg.on_export:
                 try:
@@ -12541,7 +12642,7 @@ def run_qt(video_path):
             if k in (QtCore.Qt.Key_I,):
                 r = self.scenes[self.active_scene].rois[self.active_roi]
                 # modes = ["flux_dog", "axis_jerk", "flux_dog_jerk"]
-                modes = ["hybrid", "fast", "smooth"]
+                modes = ["hybrid", "fast", "smooth", "reversal"]
                 cur = str(getattr(r, "impact_mode", "flux_dog")).lower()
                 r.impact_mode = modes[(modes.index(cur)+1)%len(modes)]
                 self.scenes[self.active_scene].rois[self.active_roi] = r

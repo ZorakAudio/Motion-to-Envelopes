@@ -1576,8 +1576,8 @@ class Analyzer:
                                    ffmpeg_bin=args.ffmpeg_bin, vcodec=args.vcodec, crf=args.crf,
                                    preset=args.preset, pix_fmt_out=args.pix_fmt)
         if self.show_window:
-            cv.namedWindow("Camera Analyzer v5F", cv.WINDOW_NORMAL)
-            cv.resizeWindow("Camera Analyzer v5F", self.W, self.H + HUD_BAND_H + GRAPH_H)
+            cv.namedWindow("Global Motion Tracker", cv.WINDOW_NORMAL)
+            cv.resizeWindow("Global Motion Tracker", self.W, self.H + HUD_BAND_H + GRAPH_H)
 
         # --- PATCH 1: seed ORB cache (Analyzer.__init__) ---
         ok, prev = self.cap.read(); assert ok, "No frames in input."
@@ -1989,7 +1989,7 @@ class Analyzer:
             if out.shape[1] != self.outW or out.shape[0] != self.outH:
                 out = cv.resize(out, (self.outW, self.outH), cv.INTER_AREA)
             if self.vw is not None: self.vw.write(out)
-            if self.show_window: cv.imshow("Camera Analyzer v5F", out)
+            if self.show_window: cv.imshow("Global Motion Tracker", out)
 
             metrics = dict(frame=self.frame_idx-1, t=time_s,
                         dx=dx, dy=dy, yaw=yaw, rot2d=rot2d, trans=trans_mag, cut=int(cut_now))
@@ -2149,6 +2149,14 @@ class Analyzer:
             self.vz_live = self._lp1_step(self.vz_live, vz_raw, self.live_lp_hz)
 
         vx_ps, vy_ps, vz_ps = self.vx_live, self.vy_live, self.vz_live
+        # export parity: store the same inertial motion you see in the HUD arrows
+        try:
+            row.vx_px_s = float(vx_ps)
+            row.vy_px_s = float(vy_ps)
+            row.vz_rel_s = float(vz_ps)
+        except Exception:
+            pass
+
         flux  = math.sqrt(vx_ps*vx_ps + vy_ps*vy_ps + (self.args.flux_z_weight * vz_ps*vz_ps))
 
         # update running global XY max (first pass) and lock after v3_lock_s
@@ -2184,7 +2192,7 @@ class Analyzer:
         out = np.vstack([gui, band, graph])
         if out.shape[1] != self.outW or out.shape[0] != self.outH: out = cv.resize(out, (self.outW, self.outH), cv.INTER_AREA)
         if self.vw is not None: self.vw.write(out)
-        if self.show_window: cv.imshow("Camera Analyzer v5F", out)
+        if self.show_window: cv.imshow("Global Motion Tracker", out)
         metrics = dict(frame=self.frame_idx-1, t=time_s,
                     dx=dx, dy=dy, yaw=yaw, rot2d=rot2d, trans=trans_mag)
         return True, self.frame_idx-1, gui, row, metrics
@@ -2299,8 +2307,14 @@ class Analyzer:
         rol_u = np.rad2deg(np.unwrap(np.deg2rad(rol)))
 
         # raw rates
-        vx = dx * fps
-        vy = dy * fps
+        export_mode = str(getattr(args, "export_motion", "live")).lower()
+        if export_mode == "live":
+            vx = np.array([getattr(r, "vx_px_s", 0.0) for r in self.rows], float)
+            vy = np.array([getattr(r, "vy_px_s", 0.0) for r in self.rows], float)
+        else:
+            vx = dx * fps
+            vy = dy * fps
+
 
         vz_div_raw  = divz * fps * args.z_div_gain
         vz25_raw_ps = vz25 * fps * args.z_div_gain
@@ -2317,6 +2331,9 @@ class Analyzer:
             vz_rel = vz_div_raw
 
         vx, vy, vz_rel = self._apply_signs(vx, vy, vz_rel)
+        if export_mode == "live":
+            vz_rel = np.array([getattr(r, "vz_rel_s", 0.0) for r in self.rows], float)
+
 
         # Interpolate over duplicate frames so envelopes don’t staircase
         if getattr(self, "dup_flags", None) and len(self.dup_flags) == len(vx):
@@ -2700,6 +2717,9 @@ def build_arg_parser():
                 help="Hard cut if structural mean absdiff exceeds this (0..1). Higher = less sensitive.")
     ap.add_argument("--cut-hold-frames", type=int, default=2,
                 help="After detecting a cut, output neutral lanes for N frames and reset output-facing smoothers.")
+    ap.add_argument("--export-motion", choices=["raw","live"], default="live",
+                help="Export dx/dy/dz envelopes as raw per-frame (raw) or the live smoothed/inertial motion you see in the HUD arrows (live).")
+
 
 
     return ap
@@ -2719,7 +2739,7 @@ def resolve_profile(args):
     else:
         base.update(dict(pos_dead=0.15, pos_lp_hz=0.25, pos_bias_tau_s=15.0, pos_burst_gain=0.5))
     # pass-throughs
-    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix","mode","burnin_sec","restart_after_burnin","cut_resp_thresh","cut_absdiff_thresh","cut_hold_frames"):
+    for k in ("z_div_gain","reaper_push","vz_mode","vz25_mix","mode","burnin_sec","restart_after_burnin","cut_resp_thresh","cut_absdiff_thresh","cut_hold_frames","export_motion"):
         base[k] = getattr(args, k)
     base["robust_export"] = not getattr(args, "no_robust_export", False)
     for k in ("robust_z","robust_prctl","robust_gamma"): base[k] = getattr(args, k)
