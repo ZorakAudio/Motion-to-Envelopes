@@ -302,12 +302,32 @@ def _parse_cli_export(argv: List[str]) -> Dict[str, Any]:
       --export-motion [live|raw]            (default: live)
       --export-live-lp-hz <float>           (default: 0.0 = no extra LPF beyond live tracker)
       --export-live-deadband-ps <float>     (default: 0.0)
+      --export-preview                      (default: on)
+      --export-no-preview
+      --export-auto-push                    (only used if preview is disabled)
+      --export-no-auto-push
     """
     cfg: Dict[str, Any] = {
         "export_motion": "live",
         "export_live_lp_hz": 0.0,
         "export_live_deadband_ps": 0.0,
+        # NEW: manual export workflow (preview + optional push)
+        "export_preview": True,       # show "Preview Envelopes" dialog on export
+        "export_auto_push": False,    # only used when export_preview == False
     }
+
+    # --export-preview / --export-no-preview
+    if "--export-no-preview" in argv:
+        cfg["export_preview"] = False
+    if "--export-preview" in argv:
+        cfg["export_preview"] = True
+
+    # --export-auto-push / --export-no-auto-push (only used if preview is disabled)
+    if "--export-auto-push" in argv:
+        cfg["export_auto_push"] = True
+    if "--export-no-auto-push" in argv:
+        cfg["export_auto_push"] = False
+
 
     if "--export-motion" in argv:
         try:
@@ -371,6 +391,10 @@ def _qt_sanitize_argv(full_argv: List[str]) -> List[str]:
         "--ai-auto-apply-tags",
         "--ai-auto-fix-occlusion",
         "--i-accept-openai-policy",
+        "--export-preview",
+        "--export-no-preview",
+        "--export-auto-push",
+        "--export-no-auto-push",
     }
 
     out: List[str] = []
@@ -7212,6 +7236,641 @@ class DeformTracker:
 
 
 # ---------- Export helpers ----------
+# ---------- Export preview / envelope marker editing (M2E) ----------
+def _deepcopy_pickle(obj):
+    """
+    Robust deep copy for Scenes/ROIs.
+    pickle is faster + safer for nested dataclasses than copy.deepcopy in this file.
+    """
+    try:
+        return pickle.loads(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception:
+        import copy as _copy
+        return _copy.deepcopy(obj)
+
+
+def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
+    """
+    Deep-copy `sc` and trim all sampled per-frame lanes to its [start,end] window.
+    This prevents save_scene_csv_and_push(...) from mutating the "live" scene object.
+    """
+    sc2 = _deepcopy_pickle(sc)
+
+    times = list(getattr(sc2, "times", []) or [])
+    if not times:
+        return sc2
+
+    fps = float(max(1e-6, fps))
+    start_t = float(getattr(sc2, "start", 0)) / fps
+    end_frame = getattr(sc2, "end", None)
+    end_t = (float(end_frame) / fps) if (end_frame is not None) else float(times[-1])
+
+    lo = 0
+    while lo < len(times) and float(times[lo]) < start_t:
+        lo += 1
+    hi = lo
+    while hi < len(times) and float(times[hi]) <= end_t:
+        hi += 1
+
+    if lo <= 0 and hi >= len(times):
+        return sc2
+
+    sc2.times = times[lo:hi]
+
+    def _trim_dict(d):
+        if not isinstance(d, dict):
+            return
+        for k, v in list(d.items()):
+            try:
+                d[k] = list(v[lo:hi])
+            except Exception:
+                try:
+                    d[k] = list(v)
+                except Exception:
+                    pass
+
+    for nm in (
+        "roi_cx", "roi_cy",
+        "roi_vx", "roi_vy", "roi_vz",
+        "roi_env",
+        "roi_imp_in", "roi_imp_out",
+        "roi_lowconf",
+        "roi_igE", "roi_igM",
+    ):
+        _trim_dict(getattr(sc2, nm, None))
+
+    try:
+        sc2.dup_flags = list(getattr(sc2, "dup_flags", []) or [])[lo:hi]
+    except Exception:
+        pass
+
+    return sc2
+
+
+def _markers_from_spike_lanes(fi, fo):
+    """Convert per-frame spike lanes into a sorted marker list."""
+    fi = np.asarray(fi if fi is not None else [], float)
+    fo = np.asarray(fo if fo is not None else [], float)
+
+    in_idx  = np.where(fi > 0.5)[0].tolist()
+    out_idx = np.where(fo > 0.5)[0].tolist()
+
+    ms = []
+    for p in in_idx:
+        ms.append({"idx": int(p), "kind": "IN",  "src_idx": int(p)})
+    for p in out_idx:
+        ms.append({"idx": int(p), "kind": "OUT", "src_idx": int(p)})
+
+    ms.sort(key=lambda m: int(m["idx"]))
+
+    # dedupe collisions: OUT wins
+    ded = []
+    for m in ms:
+        if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+            if str(m.get("kind", "")).upper().startswith("O"):
+                ded[-1] = m
+            continue
+        ded.append(m)
+
+    for i, m in enumerate(ded):
+        m["id"] = int(i)
+    return ded
+
+
+def _phase_lanes_from_markers(T: int, markers):
+    """
+    Markers define PHASE BOUNDARIES.
+    Policy:
+      - each marker starts a phase (IN or OUT) that lasts until the next marker
+      - leading region before the first marker stays 0 (matches legacy behavior)
+      - collisions at the same index: OUT wins
+    Returns: (fi_spk, fo_spk, fi_ext, fo_ext)
+    """
+    T = int(max(0, T))
+    fi_spk = np.zeros(T, float)
+    fo_spk = np.zeros(T, float)
+    fi_ext = np.zeros(T, float)
+    fo_ext = np.zeros(T, float)
+    if T <= 0 or not markers:
+        return fi_spk, fo_spk, fi_ext, fo_ext
+
+    ms = []
+    for m in (markers or []):
+        try:
+            idx = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
+        except Exception:
+            continue
+        kind = str(m.get("kind", "IN") or "IN").upper()
+        kind = "OUT" if kind.startswith("O") else "IN"
+        ms.append({"idx": idx, "kind": kind})
+
+    if not ms:
+        return fi_spk, fo_spk, fi_ext, fo_ext
+
+    ms.sort(key=lambda x: int(x["idx"]))
+
+    # dedupe collisions: OUT wins
+    ded = []
+    for m in ms:
+        if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+            if m["kind"] == "OUT":
+                ded[-1] = m
+            continue
+        ded.append(m)
+    ms = ded
+
+    # spikes
+    for m in ms:
+        if m["kind"] == "IN":
+            fi_spk[m["idx"]] = 1.0
+        else:
+            fo_spk[m["idx"]] = 1.0
+
+    # phase regions
+    for i, m in enumerate(ms):
+        a = int(m["idx"])
+        b = int(ms[i + 1]["idx"]) if (i + 1) < len(ms) else int(T)
+        if b <= a:
+            continue
+        if m["kind"] == "IN":
+            fi_ext[a:b] = 1.0
+        else:
+            fo_ext[a:b] = 1.0
+
+    # OUT wins on collisions
+    both = (fi_ext > 0.5) & (fo_ext > 0.5)
+    fi_ext[both] = 0.0
+
+    return fi_spk, fo_spk, fi_ext, fo_ext
+
+
+def _phase_sign_from_markers(T: int, markers) -> np.ndarray:
+    """Return +1 for IN segments, -1 for OUT segments, 0 for unknown (before first marker)."""
+    T = int(max(0, T))
+    s = np.zeros(T, np.int8)
+    if T <= 0 or not markers:
+        return s
+
+    ms = []
+    for m in (markers or []):
+        try:
+            idx = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
+        except Exception:
+            continue
+        kind = str(m.get("kind", "IN") or "IN").upper()
+        kind = "OUT" if kind.startswith("O") else "IN"
+        ms.append((idx, kind))
+
+    if not ms:
+        return s
+
+    ms.sort(key=lambda x: int(x[0]))
+
+    # dedupe collisions: OUT wins
+    ded = []
+    for idx, kind in ms:
+        if ded and idx == ded[-1][0]:
+            if kind == "OUT":
+                ded[-1] = (idx, kind)
+            continue
+        ded.append((idx, kind))
+    ms = ded
+
+    for i, (a, kind) in enumerate(ms):
+        b = ms[i + 1][0] if (i + 1) < len(ms) else T
+        if b <= a:
+            continue
+        sgn = +1 if kind == "IN" else -1
+        s[a:b] = sgn
+
+    return s
+
+# ---------- Marker merge / simplification (export preview) ----------
+
+def _marker_is_edited(m: Dict[str, Any]) -> bool:
+    """
+    A marker is considered "edited" if:
+      - it was user-inserted (src_idx is None), OR
+      - it was moved (round(src_idx) != idx)
+    """
+    src = m.get("src_idx", None)
+    if src is None:
+        return True
+    try:
+        return int(round(float(src))) != int(m.get("idx", -999999))
+    except Exception:
+        return True
+
+
+def merge_phase_markers_min_gap(markers: List[Dict[str, Any]],
+                                T: int,
+                                fps: float,
+                                *,
+                                merge_ms: float = 120.0,
+                                strength_curve: Optional[np.ndarray] = None,
+                                protect_edited: bool = True) -> List[Dict[str, Any]]:
+    """
+    Merge/simplify dense IN/OUT markers.
+
+    What it does:
+      - Sort + clamp markers into [0..T-1]
+      - Same-index collisions: OUT wins
+      - If two markers are within `merge_ms`:
+          * If protect_edited=True, it will NOT delete markers you added/moved.
+          * Otherwise it keeps the stronger marker (by strength_curve[idx] if provided),
+            else keeps OUT over IN, else keeps the later marker.
+
+    This is deliberately simple: it's a "debounce + density reducer" that turns
+    micro-chatter into something editable.
+
+    Returns a NEW marker list with fresh sequential 'id'.
+    """
+    T = int(max(0, T))
+    fps = float(max(1e-6, fps))
+    if T <= 0 or not markers:
+        return []
+
+    gap = int(round((float(merge_ms) / 1000.0) * fps))
+    gap = max(0, gap)
+
+    # --- normalize + clamp ---
+    ms: List[Dict[str, Any]] = []
+    for m in (markers or []):
+        try:
+            idx = int(m.get("idx", 0))
+        except Exception:
+            continue
+        idx = int(np.clip(idx, 0, max(0, T - 1)))
+
+        kind = str(m.get("kind", "IN") or "IN").upper()
+        kind = "OUT" if kind.startswith("O") else "IN"
+
+        src = m.get("src_idx", None)
+        if src is not None:
+            try:
+                src = float(src)
+            except Exception:
+                src = None
+
+        ms.append({
+            "idx": idx,
+            "kind": kind,
+            "src_idx": src,
+            "id": m.get("id", None),
+        })
+
+    if not ms:
+        return []
+
+    ms.sort(key=lambda x: int(x["idx"]))
+
+    # --- dedupe collisions at same idx (OUT wins) ---
+    ded: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(ms):
+        j = i + 1
+        same = [ms[i]]
+        while j < len(ms) and int(ms[j]["idx"]) == int(ms[i]["idx"]):
+            same.append(ms[j])
+            j += 1
+
+        if len(same) == 1:
+            ded.append(same[0])
+            i = j
+            continue
+
+        outs = [a for a in same if a["kind"] == "OUT"]
+        cand = outs if outs else same
+
+        if protect_edited:
+            edited = [a for a in cand if _marker_is_edited(a)]
+            if edited:
+                ded.append(edited[-1])  # keep last edited candidate
+                i = j
+                continue
+
+        # choose strongest if provided, else keep last
+        if strength_curve is not None and int(len(strength_curve)) > 0:
+            best = cand[-1]
+            best_s = -1e18
+            for a in cand:
+                k = int(a["idx"])
+                s = float(strength_curve[k]) if 0 <= k < len(strength_curve) else 0.0
+                if s > best_s:
+                    best_s = s
+                    best = a
+            ded.append(best)
+        else:
+            ded.append(cand[-1])
+
+        i = j
+
+    ms = ded
+
+    # --- density reduce by min-gap ---
+    out: List[Dict[str, Any]] = []
+    for m in ms:
+        if not out:
+            out.append(m)
+            continue
+
+        prev = out[-1]
+        if int(m["idx"]) - int(prev["idx"]) <= gap:
+            # Too close: choose which one survives.
+            if protect_edited:
+                a = _marker_is_edited(prev)
+                b = _marker_is_edited(m)
+                if a and not b:
+                    continue          # keep prev
+                if b and not a:
+                    out[-1] = m       # replace with m
+                    continue
+                if a and b:
+                    out.append(m)     # refuse to auto-merge edited-vs-edited
+                    continue
+
+            keep_m = True  # default: keep later
+            if strength_curve is not None and int(len(strength_curve)) > 0:
+                ia = int(prev["idx"]); ib = int(m["idx"])
+                sa = float(strength_curve[ia]) if 0 <= ia < len(strength_curve) else 0.0
+                sb = float(strength_curve[ib]) if 0 <= ib < len(strength_curve) else 0.0
+                if sa > sb + 1e-9:
+                    keep_m = False
+                elif sb > sa + 1e-9:
+                    keep_m = True
+                else:
+                    # tie-break: OUT wins, else later wins
+                    if prev["kind"] == "OUT" and m["kind"] == "IN":
+                        keep_m = False
+                    elif m["kind"] == "OUT" and prev["kind"] == "IN":
+                        keep_m = True
+                    else:
+                        keep_m = True
+            else:
+                # no strength curve: OUT wins, else later wins
+                if prev["kind"] == "OUT" and m["kind"] == "IN":
+                    keep_m = False
+                elif m["kind"] == "OUT" and prev["kind"] == "IN":
+                    keep_m = True
+                else:
+                    keep_m = True
+
+            if keep_m:
+                out[-1] = m
+            # else keep prev
+        else:
+            out.append(m)
+
+    for k, m in enumerate(out):
+        m["id"] = int(k)
+
+    return out
+
+
+def _build_timewarp_map(T: int, markers) -> np.ndarray:
+    """
+    Build monotone piecewise-linear map: target_idx -> source_idx.
+    Each marker can optionally carry 'src_idx' (original index).
+    If src_idx is missing, it is inferred from neighbor markers that have src_idx.
+    """
+    T = int(max(0, T))
+    if T <= 1:
+        return np.arange(T, dtype=np.float64)
+
+    if not markers:
+        return np.arange(T, dtype=np.float64)
+
+    ms = []
+    for m in (markers or []):
+        try:
+            dst = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
+        except Exception:
+            continue
+        src = m.get("src_idx", None)
+        if src is not None:
+            try:
+                src = float(np.clip(float(src), 0.0, float(T - 1)))
+            except Exception:
+                src = None
+        ms.append({"dst": dst, "src": src})
+
+    if not ms:
+        return np.arange(T, dtype=np.float64)
+
+    ms.sort(key=lambda x: int(x["dst"]))
+
+    # dedupe dst collisions: keep last
+    ded = []
+    for m in ms:
+        if ded and int(m["dst"]) == int(ded[-1]["dst"]):
+            ded[-1] = m
+        else:
+            ded.append(m)
+    ms = ded
+
+    # precompute next known src
+    next_known = [None] * len(ms)
+    nxt = None
+    for i in range(len(ms) - 1, -1, -1):
+        if ms[i]["src"] is not None:
+            nxt = (int(ms[i]["dst"]), float(ms[i]["src"]))
+        next_known[i] = nxt
+
+    prev = None
+    for i, m in enumerate(ms):
+        if m["src"] is None:
+            if prev is not None and next_known[i] is not None and next_known[i][0] != prev[0]:
+                a_dst, a_src = prev
+                b_dst, b_src = next_known[i]
+                u = float(m["dst"] - a_dst) / max(1e-9, float(b_dst - a_dst))
+                m["src"] = a_src + u * (b_src - a_src)
+            elif prev is not None:
+                a_dst, a_src = prev
+                m["src"] = a_src + float(m["dst"] - a_dst)
+            elif next_known[i] is not None:
+                b_dst, b_src = next_known[i]
+                m["src"] = b_src - float(b_dst - m["dst"])
+            else:
+                m["src"] = float(m["dst"])
+        else:
+            prev = (int(m["dst"]), float(m["src"]))
+
+        m["src"] = float(np.clip(float(m["src"]), 0.0, float(T - 1)))
+
+        if m["src"] is not None:
+            prev = (int(m["dst"]), float(m["src"]))
+
+    # endpoints
+    dst_knots = [0.0] + [float(m["dst"]) for m in ms] + [float(T - 1)]
+    src_knots = [0.0] + [float(m["src"]) for m in ms] + [float(T - 1)]
+
+    # enforce strictly increasing dst for np.interp; collapse duplicates
+    dst2 = [dst_knots[0]]
+    src2 = [src_knots[0]]
+    for x, y in zip(dst_knots[1:], src_knots[1:]):
+        if x <= dst2[-1]:
+            dst2[-1] = x
+            src2[-1] = y
+        else:
+            dst2.append(x)
+            src2.append(y)
+
+    # enforce nondecreasing src (monotone warp)
+    for i in range(1, len(src2)):
+        if src2[i] < src2[i - 1]:
+            src2[i] = src2[i - 1]
+
+    grid = np.arange(T, dtype=np.float64)
+    return np.interp(grid, np.asarray(dst2, np.float64), np.asarray(src2, np.float64))
+
+
+def _warp_1d(series, map_src: np.ndarray) -> np.ndarray:
+    series = np.asarray(series if series is not None else [], np.float64)
+    T = int(map_src.size)
+    if T <= 0:
+        return np.zeros(0, np.float64)
+
+    if series.size != T:
+        if series.size <= 0:
+            series = np.zeros(T, np.float64)
+        elif series.size < T:
+            series = np.pad(series, (0, T - series.size), mode="edge")
+        else:
+            series = series[:T]
+
+    x = np.arange(T, dtype=np.float64)
+    return np.interp(map_src, x, series).astype(np.float64)
+
+
+def _enforce_aoi_sign_by_markers(vx, vy, vz, roi: "ROI", fps: float, markers):
+    """
+    Reinterpret along-axis motion so IN/OUT sign matches user markers.
+    Only touches the AoI (axis) component; perpendicular components remain.
+    """
+    vx = np.asarray(vx, np.float64)
+    vy = np.asarray(vy, np.float64)
+    vz = np.asarray(vz, np.float64)
+
+    T = int(min(vx.size, vy.size, vz.size))
+    if T <= 0:
+        return vx, vy, vz
+
+    phase_sign = _phase_sign_from_markers(T, markers)
+    if not np.any(phase_sign):
+        return vx, vy, vz
+
+    yaw  = float(getattr(roi, "io_dir_deg", getattr(roi, "dir_gate_deg", 0.0)) or 0.0)
+    elev = float(getattr(roi, "axis_elev_deg", 0.0) or 0.0)
+    ax_u, ay_u, az_u = _axis_unit3d(yaw, elev)
+
+    kz = float(getattr(roi, "axis_z_scale", 1.0) or 1.0)
+    if abs(kz) < 1e-9:
+        kz = 1.0
+
+    io_sign = float(int(getattr(roi, "io_in_sign", +1) or +1))
+
+    v3x = vx
+    v3y = vy
+    v3z = kz * vz
+
+    dot = (v3x * ax_u) + (v3y * ay_u) + (v3z * az_u)  # v_al
+    v_in = io_sign * dot
+
+    tgt = phase_sign.astype(np.float64)
+    mask = tgt != 0.0
+    if not np.any(mask):
+        return vx, vy, vz
+
+    dot_new = dot.copy()
+    # Keep magnitude, force sign by segment (+IN / -OUT).
+    dot_new[mask] = (np.abs(v_in[mask]) * tgt[mask]) / (io_sign if abs(io_sign) > 0.5 else 1.0)
+
+    # perpendicular component stays
+    vpx = v3x - dot * ax_u
+    vpy = v3y - dot * ay_u
+    vpz = v3z - dot * az_u
+
+    v3x2 = vpx + dot_new * ax_u
+    v3y2 = vpy + dot_new * ay_u
+    v3z2 = vpz + dot_new * az_u
+
+    return v3x2.astype(np.float64), v3y2.astype(np.float64), (v3z2 / kz).astype(np.float64)
+
+
+def apply_export_marker_corrections(sc: "Scene",
+                                   fps: float,
+                                   markers_by_roi: Dict[int, List[Dict[str, Any]]],
+                                   *,
+                                   warp_motion: bool = True,
+                                   warp_positions: bool = True,
+                                   enforce_aoi_sign: bool = True) -> "Scene":
+    """
+    Produce an export-only corrected scene:
+      - optional time-warp to move motion features onto edited markers
+      - optional AoI sign enforcement so IN/OUT phase matches markers
+    The returned Scene is a deep copy; the input is not mutated.
+    """
+    sc2 = _deepcopy_pickle(sc)
+
+    T = len(getattr(sc2, "times", []) or [])
+    if T <= 1:
+        return sc2
+
+    for ri, roi in enumerate(getattr(sc2, "rois", []) or []):
+        markers = (markers_by_roi or {}).get(ri) or []
+        if not markers:
+            continue
+
+        # detect if anything changed (moved markers or inserted ones)
+        changed = False
+        for m in markers:
+            src = m.get("src_idx", None)
+            try:
+                dst = int(m.get("idx", -1))
+            except Exception:
+                dst = -1
+            if src is None:
+                changed = True
+                break
+            try:
+                if int(round(float(src))) != int(dst):
+                    changed = True
+                    break
+            except Exception:
+                changed = True
+                break
+
+        # build warp map (target->source) only if enabled and changed
+        map_src = None
+        if warp_motion and changed:
+            map_src = _build_timewarp_map(T, markers)
+
+        # lanes
+        vx = np.asarray((sc2.roi_vx.get(ri, []) or []), np.float64)
+        vy = np.asarray((sc2.roi_vy.get(ri, []) or []), np.float64)
+        vz = np.asarray((sc2.roi_vz.get(ri, []) or []), np.float64)
+
+        if map_src is not None:
+            vx = _warp_1d(vx, map_src)
+            vy = _warp_1d(vy, map_src)
+            vz = _warp_1d(vz, map_src)
+
+        if enforce_aoi_sign:
+            vx, vy, vz = _enforce_aoi_sign_by_markers(vx, vy, vz, roi, fps, markers)
+
+        sc2.roi_vx[ri] = vx.tolist()
+        sc2.roi_vy[ri] = vy.tolist()
+        sc2.roi_vz[ri] = vz.tolist()
+
+        if warp_positions and map_src is not None:
+            cx = np.asarray((sc2.roi_cx.get(ri, []) or []), np.float64)
+            cy = np.asarray((sc2.roi_cy.get(ri, []) or []), np.float64)
+            sc2.roi_cx[ri] = _warp_1d(cx, map_src).tolist()
+            sc2.roi_cy[ri] = _warp_1d(cy, map_src).tolist()
+
+    return sc2
+
+
 def _envelope(seq, fps, atk_s=0.015, rel_s=0.060):
     atk = 1 - np.exp(-1/(fps*atk_s)); rel = 1 - np.exp(-1/(fps*rel_s))
     y=0.0; out=[]
@@ -8798,7 +9457,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -9288,8 +9947,22 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
 
         # === IMPACTS: mirror export_fullpass ===
-        fi_live = _np.asarray(_in_dict.get(ri, []),  float)
-        fo_live = _np.asarray(_out_dict.get(ri, []), float)
+        # Manual phase-marker override (from export preview UI)
+        _override_markers = None
+        try:
+            if isinstance(phase_markers_by_roi, dict) and (ri in phase_markers_by_roi):
+                _override_markers = phase_markers_by_roi.get(ri) or None
+        except Exception:
+            _override_markers = None
+
+        if _override_markers:
+            _fi_m_spk, _fo_m_spk, _fi_m_ext, _fo_m_ext = _phase_lanes_from_markers(T, _override_markers)
+            fi_live = _np.asarray(_fi_m_spk,  float)
+            fo_live = _np.asarray(_fo_m_spk, float)
+        else:
+            _fi_m_spk = _fo_m_spk = _fi_m_ext = _fo_m_ext = None
+            fi_live = _np.asarray(_in_dict.get(ri, []),  float)
+            fo_live = _np.asarray(_out_dict.get(ri, []), float)
         used_live = (fi_live.size or fo_live.size)
 
 
@@ -9315,11 +9988,22 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             fi = _np.zeros(T, float); fo = _np.zeros(T, float)
             fi[fi_idx] = 1.0; fo[fo_idx] = 1.0
 
+            # If we came from the export preview marker editor, do NOT let refractory delete user edits.
+            if _override_markers:
+                fi = _np.asarray(_fi_m_spk, float)
+                fo = _np.asarray(_fo_m_spk, float)
 
             # extend impacts until direction flip
             fi, fo = _extend_impacts_to_dir_flip(r, vx_s, vy_s, vz_s, fi, fo, fps)
             # Ensure extended lanes exist for downstream code (and for collision policy)
             fi_ext, fo_ext = fi, fo
+
+            # Marker override: phase regions come from markers (between markers), not from velocity flips.
+            if _override_markers:
+                fi_ext = _np.asarray(_fi_m_ext, float)
+                fo_ext = _np.asarray(_fo_m_ext, float)
+                fi = _np.asarray(_fi_m_spk, float)
+                fo = _np.asarray(_fo_m_spk, float)
 
             # OUT wins on collisions (must apply to EXTENDED lanes)
             both = (fi_ext > 0.5) & (fo_ext > 0.5)
@@ -10984,17 +11668,76 @@ def run_qt(video_path):
             self.scenes[si].end = None
             setattr(self.scenes[si], "_export_pending", False)
             print(f"[scene] cleared end for scene {si}")
+
         def export_scene(self, si):
-            if si<0 or si>=len(self.scenes): return
-            sc = self.scenes[si]
-            csv_path = save_scene_csv_and_push(video_path, si, sc, self.fps, self.W, self.H, robust_gamma=1.0, push=True,
-                                            export_motion=str(export_cfg.get('export_motion','live')),
-                                            export_live_lp_hz=float(export_cfg.get('export_live_lp_hz',0.0)),
-                                            export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps',0.0)))
-            # Optional: AI sidecar inference on export (does NOT change the CSV schema)
-            if self.ai_cfg.enabled and self.ai_cfg.on_export:
+            if si < 0 or si >= len(self.scenes):
+                return
+
+            sc_src = self.scenes[si]
+
+            # Export must never mutate the tracked scene.
+            sc_trim = _trim_scene_copy_for_export(sc_src, self.fps)
+
+            do_preview = bool(export_cfg.get("export_preview", True))
+            csv_path = None
+            sc_for_ai = sc_trim
+
+            if do_preview:
+                dlg = ExportPreviewDialog(self.mw, video_path, si, sc_trim, self.fps, self.W, self.H, sc_src=sc_src)
+                if dlg.exec() != QtWidgets.QDialog.Accepted:
+                    return
+
+                payload = dlg.export_payload()
+                if not payload:
+                    return
+
+                apply_correction, markers_by_roi, opts, do_push = payload
+
+                # Persist edits back onto the live scene (time-based so trimming doesn't break them).
                 try:
-                    self.ai_run_on_export(si, sc, csv_path)
+                    sc_src._export_markers_time_by_roi = dlg.export_markers_time_by_roi()
+                    sc_src._export_marker_opts = dict(opts or {})
+                except Exception:
+                    pass
+
+                sc_out = sc_trim
+                phase_markers = None
+
+                if apply_correction and markers_by_roi:
+                    sc_out = apply_export_marker_corrections(
+                        sc_trim, self.fps, markers_by_roi,
+                        warp_motion=bool(opts.get("warp_motion", True)),
+                        warp_positions=bool(opts.get("warp_positions", True)),
+                        enforce_aoi_sign=bool(opts.get("enforce_aoi_sign", True)),
+                    )
+                    phase_markers = markers_by_roi
+
+                sc_for_ai = sc_out
+                csv_path = save_scene_csv_and_push(
+                    video_path, si, sc_out, self.fps, self.W, self.H,
+                    robust_gamma=1.0,
+                    push=bool(do_push),
+                    export_motion=str(export_cfg.get('export_motion', 'live')),
+                    export_live_lp_hz=float(export_cfg.get('export_live_lp_hz', 0.0)),
+                    export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps', 0.0)),
+                    phase_markers_by_roi=phase_markers,
+                )
+            else:
+                # No preview: manual push remains OFF unless explicitly enabled.
+                do_push = bool(export_cfg.get("export_auto_push", False))
+                csv_path = save_scene_csv_and_push(
+                    video_path, si, sc_trim, self.fps, self.W, self.H,
+                    robust_gamma=1.0,
+                    push=do_push,
+                    export_motion=str(export_cfg.get('export_motion', 'live')),
+                    export_live_lp_hz=float(export_cfg.get('export_live_lp_hz', 0.0)),
+                    export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps', 0.0)),
+                )
+
+            # Optional: AI sidecar inference on export (does NOT change the CSV schema)
+            if csv_path and self.ai_cfg.enabled and self.ai_cfg.on_export:
+                try:
+                    self.ai_run_on_export(si, sc_for_ai, csv_path)
                 except Exception:
                     pass
             return csv_path
@@ -12723,6 +13466,989 @@ def run_qt(video_path):
                 for si, sc in enumerate(self.scenes):
                     if sc.times: self.export_scene(si)
                 return
+
+    # ---------------- Export Preview / Marker Editor (manual envelope correction) ----------------
+    class _Sparkline(QtWidgets.QWidget):
+        """
+        Tiny multi-curve plot widget:
+          - curve[0] = baseline (gray)
+          - curve[1] = corrected (white) if present
+          - marker verticals: IN (cyan-ish), OUT (orange-ish)
+        """
+        def __init__(self, title: str, y_min: float, y_max: float, parent=None):
+            super().__init__(parent)
+            self._title = str(title)
+            self._ymin = float(y_min)
+            self._ymax = float(y_max)
+            self._curves = []  # list[np.ndarray]
+            self._markers = []  # list[dict{idx,kind}]
+            self.setMinimumHeight(70)
+
+        def set_data(self, curves, markers):
+            self._curves = []
+            for c in (curves or []):
+                try:
+                    a = np.asarray(c, np.float64)
+                    if a.size:
+                        self._curves.append(a)
+                except Exception:
+                    pass
+            self._markers = list(markers or [])
+            self.update()
+
+        def paintEvent(self, ev):
+            p = QtGui.QPainter(self)
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+            W = self.width()
+            H = self.height()
+
+            # background
+            p.fillRect(0, 0, W, H, QtGui.QColor(20, 20, 22))
+
+            # title
+            p.setPen(QtGui.QPen(QtGui.QColor(160, 160, 160)))
+            p.drawText(6, 14, self._title)
+
+            # plot rect
+            top = 18
+            pad = 6
+            x0 = pad
+            x1 = W - pad
+            y0 = top
+            y1 = H - pad
+            if x1 <= x0 + 2 or y1 <= y0 + 2:
+                return
+
+            # grid line mid
+            p.setPen(QtGui.QPen(QtGui.QColor(40, 40, 44)))
+            midy = int((y0 + y1) * 0.5)
+            p.drawLine(x0, midy, x1, midy)
+
+            def _xy(i, v, n):
+                if n <= 1:
+                    x = x0
+                else:
+                    x = x0 + (x1 - x0) * (float(i) / float(n - 1))
+                v = float(v)
+                if self._ymax <= self._ymin + 1e-9:
+                    t = 0.5
+                else:
+                    t = (v - self._ymin) / (self._ymax - self._ymin)
+                t = max(0.0, min(1.0, t))
+                y = y1 - (y1 - y0) * t
+                return x, y
+
+            # markers
+            if self._markers and self._curves:
+                n = int(self._curves[0].size)
+                for m in self._markers:
+                    try:
+                        idx = int(m.get("idx", -1))
+                    except Exception:
+                        continue
+                    if idx < 0 or idx >= n:
+                        continue
+                    kind = str(m.get("kind", "IN")).upper()
+                    col = QtGui.QColor(0, 170, 255) if kind.startswith("I") else QtGui.QColor(255, 170, 40)
+                    p.setPen(QtGui.QPen(col, 1))
+                    x, _ = _xy(idx, 0.0, n)
+                    p.drawLine(int(x), y0, int(x), y1)
+
+            # curves
+            pens = [
+                QtGui.QPen(QtGui.QColor(110, 110, 110), 1),   # baseline
+                QtGui.QPen(QtGui.QColor(230, 230, 230), 2),   # corrected
+            ]
+            for ci, c in enumerate(self._curves[:2]):
+                n = int(c.size)
+                if n <= 1:
+                    continue
+                pen = pens[min(ci, len(pens) - 1)]
+                p.setPen(pen)
+                path = QtGui.QPainterPath()
+                x, y = _xy(0, c[0], n)
+                path.moveTo(x, y)
+                step = max(1, n // max(1, (W - 2 * pad)))
+                for i in range(step, n, step):
+                    x, y = _xy(i, c[i], n)
+                    path.lineTo(x, y)
+                # ensure last point
+                x, y = _xy(n - 1, c[n - 1], n)
+                path.lineTo(x, y)
+                p.drawPath(path)
+
+            p.end()
+
+
+    class ExportPreviewDialog(QtWidgets.QDialog):
+        """
+        Export-time envelope marker editor:
+          - edits *phase markers* (IN/OUT boundaries) per ROI
+          - optional time-warp (stretch/compress) between markers
+          - optional AoI sign enforcement by marker phase
+        """
+        def __init__(self, parent, video_path: str, scene_id: int, sc_trim: Scene,
+                     fps: float, W: int, H: int, *, sc_src: Optional[Scene] = None):
+            super().__init__(parent)
+            self.setWindowTitle(f"Preview Envelopes — Scene {scene_id}")
+            self.resize(1040, 720)
+
+            self.video_path = str(video_path)
+            self.scene_id = int(scene_id)
+            self.sc = sc_trim
+            self.fps = float(fps)
+            self.W = int(W)
+            self.H = int(H)
+            self.sc_src = sc_src
+
+            self._push = False
+            self._accepted = False
+
+            self._cap = None
+            try:
+                self._cap = cv.VideoCapture(self.video_path)
+            except Exception:
+                self._cap = None
+
+            self.T = int(len(getattr(self.sc, "times", []) or []))
+            self._markers_by_roi: Dict[int, List[Dict[str, Any]]] = {}
+            self._dirty_by_roi: Dict[int, bool] = {}
+            self._base_preview: Dict[int, Dict[str, np.ndarray]] = {}
+
+            # Load saved marker edits (time-based) if present
+            self._saved_time_by_roi = None
+            self._saved_opts = None
+            if self.sc_src is not None:
+                try:
+                    self._saved_time_by_roi = getattr(self.sc_src, "_export_markers_time_by_roi", None)
+                except Exception:
+                    self._saved_time_by_roi = None
+                try:
+                    self._saved_opts = getattr(self.sc_src, "_export_marker_opts", None)
+                except Exception:
+                    self._saved_opts = None
+
+            self._build_initial_markers()
+
+            # UI ----------------------------------------------------------------------
+            root = QtWidgets.QVBoxLayout(self)
+
+            # top row: ROI selector + status
+            top_row = QtWidgets.QHBoxLayout()
+            root.addLayout(top_row)
+
+            self.cbo_roi = QtWidgets.QComboBox()
+            for ri, r in enumerate(getattr(self.sc, "rois", []) or []):
+                lab = str(getattr(r, "label", f"ROI {ri}"))
+                top = f"ROI {ri}: {lab}"
+                self.cbo_roi.addItem(top, ri)
+            top_row.addWidget(QtWidgets.QLabel("Edit ROI:"))
+            top_row.addWidget(self.cbo_roi, 1)
+
+            self.lbl_status = QtWidgets.QLabel("")
+            self.lbl_status.setStyleSheet("color: #b0b0b0;")
+            top_row.addWidget(self.lbl_status, 2)
+
+            # main split
+            split = QtWidgets.QHBoxLayout()
+            root.addLayout(split, 1)
+
+            # LEFT: frame preview + slider + plots
+            left = QtWidgets.QVBoxLayout()
+            split.addLayout(left, 2)
+
+            self.lbl_frame = QtWidgets.QLabel()
+            self.lbl_frame.setMinimumSize(480, 270)
+            self.lbl_frame.setAlignment(QtCore.Qt.AlignCenter)
+            self.lbl_frame.setStyleSheet("background: #111; border: 1px solid #333;")
+            left.addWidget(self.lbl_frame, 5)
+
+            # scrub controls
+            scrub = QtWidgets.QHBoxLayout()
+            left.addLayout(scrub)
+            self.sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld.setMinimum(0)
+            self.sld.setMaximum(max(0, self.T - 1))
+            self.sld.setValue(0)
+            scrub.addWidget(self.sld, 1)
+            self.lbl_t = QtWidgets.QLabel("t=0.000s  idx=0")
+            self.lbl_t.setStyleSheet("color: #c0c0c0;")
+            scrub.addWidget(self.lbl_t)
+
+            # plots
+            self.plot_flux = _Sparkline("Flux (0..1)", 0.0, 1.0)
+            self.plot_axis = _Sparkline("AoI v (−1..+1)", -1.0, 1.0)
+            self.plot_lat  = _Sparkline("Lateral amp (0..1)", 0.0, 1.0)
+            left.addWidget(self.plot_flux, 2)
+            left.addWidget(self.plot_axis, 2)
+            left.addWidget(self.plot_lat,  2)
+
+            # RIGHT: marker table + tools
+            right = QtWidgets.QVBoxLayout()
+            split.addLayout(right, 2)
+
+            self.tbl = QtWidgets.QTableWidget()
+            self.tbl.setColumnCount(4)
+            self.tbl.setHorizontalHeaderLabels(["Type", "Sample", "Time", "Src"])
+            self.tbl.horizontalHeader().setStretchLastSection(True)
+            self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            right.addWidget(self.tbl, 5)
+
+            tools = QtWidgets.QHBoxLayout()
+            right.addLayout(tools)
+
+            self.btn_add_in = QtWidgets.QPushButton("Add IN (I)")
+            self.btn_add_out = QtWidgets.QPushButton("Add OUT (O)")
+            self.btn_del = QtWidgets.QPushButton("Delete (Del)")
+
+            # NEW: merge/simplify dense markers (micro-chatter killer)
+            self.spn_merge_ms = QtWidgets.QSpinBox()
+            self.spn_merge_ms.setRange(10, 2000)
+            self.spn_merge_ms.setValue(120)
+            self.spn_merge_ms.setToolTip("Merge markers closer than this many milliseconds (per ROI).")
+
+            self.btn_merge = QtWidgets.QPushButton("Merge (M)")
+            self.btn_merge.setToolTip("Collapse dense IN/OUT chatter into fewer boundaries.\n"
+                                    "Uses Flux as a strength curve and avoids deleting edited markers.")
+
+            tools.addWidget(self.btn_add_in)
+            tools.addWidget(self.btn_add_out)
+            tools.addWidget(self.btn_del)
+            tools.addSpacing(12)
+            tools.addWidget(QtWidgets.QLabel("Merge ≤ ms:"))
+            tools.addWidget(self.spn_merge_ms)
+            tools.addWidget(self.btn_merge)
+            tools.addStretch(1)
+
+
+            # correction options
+            opt_box = QtWidgets.QGroupBox("Correction")
+            right.addWidget(opt_box, 2)
+            opt = QtWidgets.QVBoxLayout(opt_box)
+
+            self.chk_apply = QtWidgets.QCheckBox("Apply corrections from markers on export")
+            self.chk_warp = QtWidgets.QCheckBox("Time-warp (stretch/compress) between markers")
+            self.chk_pos  = QtWidgets.QCheckBox("Also warp center (cx/cy)")
+            self.chk_sign = QtWidgets.QCheckBox("Enforce AoI IN/OUT sign by marker phase")
+
+            opt.addWidget(self.chk_apply)
+            opt.addWidget(self.chk_warp)
+            opt.addWidget(self.chk_pos)
+            opt.addWidget(self.chk_sign)
+
+            # defaults
+            has_saved_any = bool(self._saved_time_by_roi)
+            self.chk_apply.setChecked(bool(has_saved_any))
+            self.chk_warp.setChecked(True)
+            self.chk_pos.setChecked(True)
+            self.chk_sign.setChecked(True)
+            if isinstance(self._saved_opts, dict):
+                self.chk_apply.setChecked(bool(self._saved_opts.get("apply", self.chk_apply.isChecked())))
+                self.chk_warp.setChecked(bool(self._saved_opts.get("warp_motion", True)))
+                self.chk_pos.setChecked(bool(self._saved_opts.get("warp_positions", True)))
+                self.chk_sign.setChecked(bool(self._saved_opts.get("enforce_aoi_sign", True)))
+
+            # buttons
+            btns = QtWidgets.QHBoxLayout()
+            root.addLayout(btns)
+            btns.addStretch(1)
+            self.btn_cancel = QtWidgets.QPushButton("Cancel")
+            self.btn_export = QtWidgets.QPushButton("Export CSV")
+            self.btn_push   = QtWidgets.QPushButton("Export & Push")
+            btns.addWidget(self.btn_cancel)
+            btns.addWidget(self.btn_export)
+            btns.addWidget(self.btn_push)
+
+            # wiring ------------------------------------------------------------------
+            self._building = False
+            self.cbo_roi.currentIndexChanged.connect(self._on_roi_changed)
+            self.sld.valueChanged.connect(self._on_scrub)
+            self.btn_add_in.clicked.connect(lambda: self._add_marker("IN"))
+            self.btn_add_out.clicked.connect(lambda: self._add_marker("OUT"))
+            self.btn_del.clicked.connect(self._delete_selected)
+            self.btn_merge.clicked.connect(self._merge_markers_nearby)
+            self.tbl.itemSelectionChanged.connect(self._on_table_sel)
+            self.chk_apply.toggled.connect(self._update_preview)
+            self.chk_warp.toggled.connect(self._update_preview)
+            self.chk_pos.toggled.connect(self._update_preview)
+            self.chk_sign.toggled.connect(self._update_preview)
+            self.btn_cancel.clicked.connect(self.reject)
+            self.btn_export.clicked.connect(self._accept_export_csv)
+            self.btn_push.clicked.connect(self._accept_export_push)
+
+            # init view
+            self._on_roi_changed()
+
+        # ---------------- data init ----------------
+        def _build_initial_markers(self):
+            self._markers_by_roi.clear()
+            self._dirty_by_roi.clear()
+
+            times = np.asarray(getattr(self.sc, "times", []) or [], np.float64)
+            if times.size <= 0:
+                return
+
+            for ri, r in enumerate(getattr(self.sc, "rois", []) or []):
+                ms = None
+
+                # load saved time markers
+                if isinstance(self._saved_time_by_roi, dict) and (ri in self._saved_time_by_roi):
+                    saved = self._saved_time_by_roi.get(ri) or []
+                    ms = []
+                    for ent in saved:
+                        try:
+                            t = float(ent.get("t", None))
+                        except Exception:
+                            continue
+                        if not np.isfinite(t):
+                            continue
+                        kind = str(ent.get("kind", "IN") or "IN").upper()
+                        kind = "OUT" if kind.startswith("O") else "IN"
+                        # nearest sample idx
+                        j = int(np.argmin(np.abs(times - t)))
+                        if j < 0 or j >= times.size:
+                            continue
+                        src_idx = None
+                        try:
+                            src_t = ent.get("src_t", None)
+                            if src_t is not None:
+                                src_t = float(src_t)
+                                src_idx = int(np.argmin(np.abs(times - src_t)))
+                        except Exception:
+                            src_idx = None
+                        ms.append({"idx": int(j), "kind": kind, "src_idx": (int(src_idx) if src_idx is not None else None)})
+                    ms.sort(key=lambda m: int(m.get("idx", 0)))
+
+                # fallback: live spikes (auto detection)
+                if ms is None:
+                    fi = np.asarray(self.sc.roi_imp_in.get(ri, []) or [], np.float64)
+                    fo = np.asarray(self.sc.roi_imp_out.get(ri, []) or [], np.float64)
+                    # fit to T
+                    T = int(times.size)
+                    if fi.size < T: fi = np.pad(fi, (0, T - fi.size))
+                    if fo.size < T: fo = np.pad(fo, (0, T - fo.size))
+                    fi = fi[:T]; fo = fo[:T]
+                    ms = _markers_from_spike_lanes(fi, fo)
+
+                # normalize + dedupe collisions (OUT wins)
+                ms2 = []
+                for m in (ms or []):
+                    try:
+                        idx = int(np.clip(int(m.get("idx", 0)), 0, int(times.size - 1)))
+                    except Exception:
+                        continue
+                    kind = str(m.get("kind", "IN") or "IN").upper()
+                    kind = "OUT" if kind.startswith("O") else "IN"
+                    src = m.get("src_idx", None)
+                    if src is not None:
+                        try:
+                            src = int(np.clip(int(src), 0, int(times.size - 1)))
+                        except Exception:
+                            src = None
+                    ms2.append({"idx": idx, "kind": kind, "src_idx": src})
+
+                ms2.sort(key=lambda x: int(x["idx"]))
+                ded = []
+                for m in ms2:
+                    if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+                        if m["kind"] == "OUT":
+                            ded[-1] = m
+                        continue
+                    ded.append(m)
+                for i, m in enumerate(ded):
+                    m["id"] = i
+                self._markers_by_roi[ri] = ded
+                self._dirty_by_roi[ri] = False
+
+        # ---------------- UI helpers ----------------
+        def _cur_roi(self) -> int:
+            try:
+                return int(self.cbo_roi.currentData())
+            except Exception:
+                return 0
+
+        def _markers(self, ri: Optional[int] = None) -> List[Dict[str, Any]]:
+            ri = self._cur_roi() if ri is None else int(ri)
+            return self._markers_by_roi.get(ri, [])
+
+        def _set_dirty(self, ri: int, v: bool = True):
+            self._dirty_by_roi[int(ri)] = bool(v)
+            if v:
+                self.chk_apply.setChecked(True)
+
+        def _rebuild_table(self):
+            ri = self._cur_roi()
+            ms = self._markers(ri)
+
+            self._building = True
+            try:
+                self.tbl.setRowCount(len(ms))
+                for row, m in enumerate(ms):
+                    # Type
+                    cbo = QtWidgets.QComboBox()
+                    cbo.addItems(["IN", "OUT"])
+                    cbo.setCurrentText(str(m.get("kind", "IN")).upper().startswith("O") and "OUT" or "IN")
+
+                    def _on_kind_changed(txt, row=row):
+                        if self._building:
+                            return
+                        ms2 = self._markers(ri)
+                        if 0 <= row < len(ms2):
+                            ms2[row]["kind"] = "OUT" if str(txt).upper().startswith("O") else "IN"
+                            self._set_dirty(ri, True)
+                            self._update_preview()
+
+                    cbo.currentTextChanged.connect(_on_kind_changed)
+                    self.tbl.setCellWidget(row, 0, cbo)
+
+                    # Sample
+                    spn = QtWidgets.QSpinBox()
+                    spn.setMinimum(0)
+                    spn.setMaximum(max(0, self.T - 1))
+                    spn.setValue(int(m.get("idx", 0)))
+
+                    def _on_idx_changed(val, row=row):
+                        if self._building:
+                            return
+                        ms2 = self._markers(ri)
+                        if not (0 <= row < len(ms2)):
+                            return
+                        # clamp to preserve ordering
+                        mn = 0
+                        mx = max(0, self.T - 1)
+                        if row > 0:
+                            mn = int(ms2[row - 1]["idx"]) + 1
+                        if row + 1 < len(ms2):
+                            mx = int(ms2[row + 1]["idx"]) - 1
+                        val2 = int(np.clip(int(val), mn, mx))
+                        if val2 != int(val):
+                            self._building = True
+                            spn.setValue(val2)
+                            self._building = False
+                        ms2[row]["idx"] = int(val2)
+                        self._set_dirty(ri, True)
+                        self._update_preview()
+                    spn.valueChanged.connect(_on_idx_changed)
+                    self.tbl.setCellWidget(row, 1, spn)
+
+                    # Time (read-only)
+                    t = ""
+                    try:
+                        idx = int(m.get("idx", 0))
+                        if 0 <= idx < self.T:
+                            t = f"{float(self.sc.times[idx]):.3f}s"
+                    except Exception:
+                        t = ""
+                    it = QtWidgets.QTableWidgetItem(t)
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.tbl.setItem(row, 2, it)
+
+                    # Src (read-only)
+                    src = m.get("src_idx", None)
+                    st = "" if src is None else f"{int(src)}"
+                    it2 = QtWidgets.QTableWidgetItem(st)
+                    it2.setFlags(it2.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.tbl.setItem(row, 3, it2)
+
+                self.tbl.resizeColumnsToContents()
+            finally:
+                self._building = False
+
+        def _on_roi_changed(self):
+            self._rebuild_table()
+            self._update_preview()
+            self._on_scrub(self.sld.value())
+
+        def _on_table_sel(self):
+            if self._building:
+                return
+            rows = self.tbl.selectionModel().selectedRows()
+            if rows:
+                r = int(rows[0].row())
+                ms = self._markers()
+                if 0 <= r < len(ms):
+                    self.sld.setValue(int(ms[r]["idx"]))
+
+        def _on_scrub(self, idx):
+            idx = int(np.clip(int(idx), 0, max(0, self.T - 1)))
+            if self.T > 0:
+                try:
+                    t = float(self.sc.times[idx])
+                except Exception:
+                    t = 0.0
+                self.lbl_t.setText(f"t={t:.3f}s  idx={idx}")
+            else:
+                self.lbl_t.setText("t=—  idx=—")
+            self._update_frame_preview(idx)
+
+        def _selected_row(self) -> int:
+            rows = self.tbl.selectionModel().selectedRows()
+            return int(rows[0].row()) if rows else -1
+
+        def _add_marker(self, kind: str):
+            if self.T <= 0:
+                return
+            ri = self._cur_roi()
+            kind = "OUT" if str(kind).upper().startswith("O") else "IN"
+            idx = int(self.sld.value())
+
+            ms = list(self._markers(ri))
+
+            # collision: overwrite existing at same idx
+            for m in ms:
+                if int(m.get("idx", -999)) == idx:
+                    m["kind"] = kind
+                    m["src_idx"] = m.get("src_idx", None)  # keep
+                    self._markers_by_roi[ri] = sorted(ms, key=lambda x: int(x["idx"]))
+                    self._set_dirty(ri, True)
+                    self._rebuild_table()
+                    self._update_preview()
+                    return
+
+            ms.append({"idx": idx, "kind": kind, "src_idx": None, "id": int(max([m.get("id", -1) for m in ms] + [-1]) + 1)})
+            ms.sort(key=lambda x: int(x["idx"]))
+
+            # dedupe again (OUT wins)
+            ded = []
+            for m in ms:
+                if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+                    if m["kind"] == "OUT":
+                        ded[-1] = m
+                    continue
+                ded.append(m)
+            self._markers_by_roi[ri] = ded
+
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._update_preview()
+
+        def _delete_selected(self):
+            ri = self._cur_roi()
+            row = self._selected_row()
+            ms = list(self._markers(ri))
+            if not (0 <= row < len(ms)):
+                return
+            del ms[row]
+            self._markers_by_roi[ri] = ms
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._update_preview()
+
+        def _merge_markers_nearby(self):
+            ri = self._cur_roi()
+            ms = list(self._markers(ri))
+            if not ms or self.T <= 0:
+                return
+
+            # Ensure base preview exists so we can use Flux as a strength curve
+            if ri not in self._base_preview:
+                vx = np.asarray(self.sc.roi_vx.get(ri, []) or [], np.float64)
+                vy = np.asarray(self.sc.roi_vy.get(ri, []) or [], np.float64)
+                vz = np.asarray(self.sc.roi_vz.get(ri, []) or [], np.float64)
+                self._base_preview[ri] = self._compute_preview_from_v(ri, vx, vy, vz)
+
+            base = self._base_preview.get(ri, {}) or {}
+            strength = None
+            try:
+                strength = np.asarray(base.get("flux", None), np.float64)
+            except Exception:
+                strength = None
+
+            merge_ms = float(self.spn_merge_ms.value())
+
+            merged = merge_phase_markers_min_gap(
+                ms, self.T, self.fps,
+                merge_ms=merge_ms,
+                strength_curve=strength,
+                protect_edited=True,
+            )
+
+            # Only update if changed
+            if len(merged) == len(ms):
+                # still might be different ids/order, but if lengths match we can cheap-check structure
+                same = True
+                for a, b in zip(ms, merged):
+                    if int(a.get("idx", -1)) != int(b.get("idx", -2)) or str(a.get("kind")) != str(b.get("kind")):
+                        same = False
+                        break
+                if same:
+                    return
+
+            self._markers_by_roi[ri] = merged
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._update_preview()
+
+
+        # ---------------- preview computation ----------------
+        def _fit_len(self, a):
+            a = np.asarray(a if a is not None else [], np.float64)
+            if a.size < self.T:
+                a = np.pad(a, (0, self.T - a.size), mode="edge") if a.size else np.zeros(self.T, np.float64)
+            if a.size > self.T:
+                a = a[:self.T]
+            return a
+
+        def _compute_preview_from_v(self, ri: int, vx, vy, vz) -> Dict[str, np.ndarray]:
+            vx = self._fit_len(vx)
+            vy = self._fit_len(vy)
+            vz = self._fit_len(vz)
+
+            # "live-ish" smoothing
+            vx_s = robust_smooth(vx, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
+            vy_s = robust_smooth(vy, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
+            vz_s = robust_smooth(vz, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
+
+            speed = np.sqrt(vx_s*vx_s + vy_s*vy_s + vz_s*vz_s)
+            flux = normalize_unsigned01(speed)
+
+            r = self.sc.rois[ri]
+            yaw  = float(getattr(r, "io_dir_deg", getattr(r, "dir_gate_deg", 0.0)) or 0.0)
+            elev = float(getattr(r, "axis_elev_deg", 0.0) or 0.0)
+            kz   = float(getattr(r, "axis_z_scale", 1.0) or 1.0)
+            ax_u, ay_u, az_u = _axis_unit3d(yaw, elev)
+
+            vx3 = vx_s
+            vy3 = vy_s
+            vz3 = kz * vz_s
+            vmag = np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12
+
+            v_al = vx3*ax_u + vy3*ay_u + vz3*az_u
+            axis_v = normalize_signed11(v_al)
+
+            # lateral as AoI yaw+90
+            lx_u, ly_u, lz_u = _axis_unit3d(yaw + 90.0, elev)
+            v_lat_signed = vx3*lx_u + vy3*ly_u + vz3*lz_u
+            cos_lat = np.abs(v_lat_signed / vmag)
+            lat_half = float(getattr(r, "lat_half_deg", 30.0))
+            lat_pow  = float(getattr(r, "lat_power", 4.0))
+            if 0.0 < lat_half < 90.0:
+                cos_min = math.cos(math.radians(lat_half))
+                w_lat = np.zeros_like(cos_lat)
+                mask = cos_lat >= cos_min
+                if np.any(mask):
+                    w_lat[mask] = ((cos_lat[mask] - cos_min) /
+                                   max(1e-6, 1.0 - cos_min)) ** lat_pow
+            else:
+                w_lat = cos_lat ** lat_pow
+            v_lat_w = v_lat_signed * w_lat
+            lat_amp = normalize_unsigned01(np.abs(v_lat_w))
+
+            return {"flux": flux, "axis_v": axis_v, "lat_amp": lat_amp, "vx": vx, "vy": vy, "vz": vz}
+
+        def _compute_corrected_preview(self, ri: int, base: Dict[str, np.ndarray], markers):
+            vx = base["vx"].copy()
+            vy = base["vy"].copy()
+            vz = base["vz"].copy()
+
+            if self.chk_apply.isChecked():
+                # time-warp only if enabled and something changed
+                changed = False
+                for m in (markers or []):
+                    src = m.get("src_idx", None)
+                    try:
+                        dst = int(m.get("idx", -1))
+                    except Exception:
+                        dst = -1
+                    if src is None:
+                        changed = True
+                        break
+                    try:
+                        if int(round(float(src))) != int(dst):
+                            changed = True
+                            break
+                    except Exception:
+                        changed = True
+                        break
+
+                if self.chk_warp.isChecked() and changed:
+                    mp = _build_timewarp_map(self.T, markers)
+                    vx = _warp_1d(vx, mp)
+                    vy = _warp_1d(vy, mp)
+                    vz = _warp_1d(vz, mp)
+
+                if self.chk_sign.isChecked():
+                    vx, vy, vz = _enforce_aoi_sign_by_markers(vx, vy, vz, self.sc.rois[ri], self.fps, markers)
+
+            return self._compute_preview_from_v(ri, vx, vy, vz)
+
+        def _update_preview(self):
+            ri = self._cur_roi()
+            ms = self._markers(ri)
+
+            if ri not in self._base_preview:
+                vx = np.asarray(self.sc.roi_vx.get(ri, []) or [], np.float64)
+                vy = np.asarray(self.sc.roi_vy.get(ri, []) or [], np.float64)
+                vz = np.asarray(self.sc.roi_vz.get(ri, []) or [], np.float64)
+                self._base_preview[ri] = self._compute_preview_from_v(ri, vx, vy, vz)
+
+            base = self._base_preview[ri]
+            corr = self._compute_corrected_preview(ri, base, ms)
+
+            # plot: baseline + corrected if apply checked
+            flux_curves = [base["flux"]]
+            axis_curves = [base["axis_v"]]
+            lat_curves  = [base["lat_amp"]]
+            if self.chk_apply.isChecked():
+                flux_curves.append(corr["flux"])
+                axis_curves.append(corr["axis_v"])
+                lat_curves.append(corr["lat_amp"])
+
+            self.plot_flux.set_data(flux_curves, ms)
+            self.plot_axis.set_data(axis_curves, ms)
+            self.plot_lat.set_data(lat_curves, ms)
+
+            dirty = bool(self._dirty_by_roi.get(ri, False))
+            self.lbl_status.setText(f"markers={len(ms)}  dirty={dirty}  apply={self.chk_apply.isChecked()}")
+
+        # ---------------- frame preview ----------------
+        def _update_frame_preview(self, sample_idx: int):
+            if self._cap is None or self.T <= 0:
+                self.lbl_frame.setText("(no video)")
+                return
+
+            sample_idx = int(np.clip(int(sample_idx), 0, max(0, self.T - 1)))
+            try:
+                t = float(self.sc.times[sample_idx])
+            except Exception:
+                t = 0.0
+            frame_idx = int(round(t * self.fps))
+
+            try:
+                self._cap.set(cv.CAP_PROP_POS_FRAMES, max(0, frame_idx))
+                ok, frame = self._cap.read()
+            except Exception:
+                ok, frame = False, None
+
+            if not ok or frame is None:
+                self.lbl_frame.setText("(frame read failed)")
+                return
+
+            # match processing scale
+            try:
+                frame = cv.resize(frame, (self.W, self.H), interpolation=cv.INTER_AREA)
+            except Exception:
+                pass
+
+            ri = self._cur_roi()
+            r = self.sc.rois[ri]
+            try:
+                x, y, w, h = [int(v) for v in getattr(r, "bbox", (0, 0, 0, 0))]
+            except Exception:
+                x, y, w, h = 0, 0, 0, 0
+            if w > 0 and h > 0:
+                cv.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 255), 2)
+
+            # draw tracked center if present
+            try:
+                cx = self.sc.roi_cx.get(ri, [])
+                cy = self.sc.roi_cy.get(ri, [])
+                if cx and cy and sample_idx < len(cx) and sample_idx < len(cy):
+                    px = int(round(float(cx[sample_idx])))
+                    py = int(round(float(cy[sample_idx])))
+                    cv.circle(frame, (px, py), 4, (255, 255, 255), -1)
+            except Exception:
+                pass
+
+            # render to Qt
+            try:
+                rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+                h, w, _ = rgb.shape
+                qimg = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
+                self.lbl_frame.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
+                    self.lbl_frame.width(), self.lbl_frame.height(),
+                    QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+                ))
+            except Exception:
+                self.lbl_frame.setText("(render failed)")
+
+        # ---------------- export ----------------
+        def _accept_export_csv(self):
+            self._push = False
+            self._accepted = True
+            self.accept()
+
+        def _accept_export_push(self):
+            self._push = True
+            self._accepted = True
+            self.accept()
+
+        def export_payload(self):
+            if not self._accepted:
+                return None
+
+            apply = bool(self.chk_apply.isChecked())
+            opts = {
+                "apply": apply,
+                "warp_motion": bool(self.chk_warp.isChecked()),
+                "warp_positions": bool(self.chk_pos.isChecked()),
+                "enforce_aoi_sign": bool(self.chk_sign.isChecked()),
+            }
+
+            # markers per roi
+            markers_by_roi: Dict[int, List[Dict[str, Any]]] = {}
+            for ri, ms in (self._markers_by_roi or {}).items():
+                out = []
+                for m in (ms or []):
+                    try:
+                        idx = int(m.get("idx", 0))
+                    except Exception:
+                        continue
+                    if idx < 0 or idx >= self.T:
+                        continue
+                    kind = str(m.get("kind", "IN") or "IN").upper()
+                    kind = "OUT" if kind.startswith("O") else "IN"
+                    src_idx = m.get("src_idx", None)
+                    if src_idx is not None:
+                        try:
+                            src_idx = float(src_idx)
+                        except Exception:
+                            src_idx = None
+                    out.append({"idx": int(idx), "kind": kind, "src_idx": src_idx})
+                if out:
+                    markers_by_roi[int(ri)] = out
+
+            return apply, markers_by_roi, opts, bool(self._push)
+
+        def export_markers_time_by_roi(self) -> Dict[int, List[Dict[str, Any]]]:
+            """
+            Persist edits in a trim-safe way: store marker times (seconds) instead of sample indices.
+            """
+            if self.T <= 0:
+                return {}
+            # only persist if something changed OR apply is checked OR we had saved markers before
+            persist = bool(self.chk_apply.isChecked())
+            persist = persist or any(bool(v) for v in (self._dirty_by_roi or {}).values())
+            persist = persist or bool(self._saved_time_by_roi)
+            if not persist:
+                return {}
+
+            out: Dict[int, List[Dict[str, Any]]] = {}
+            for ri, ms in (self._markers_by_roi or {}).items():
+                lst = []
+                for m in (ms or []):
+                    try:
+                        idx = int(m.get("idx", 0))
+                    except Exception:
+                        continue
+                    if idx < 0 or idx >= self.T:
+                        continue
+                    kind = str(m.get("kind", "IN") or "IN").upper()
+                    kind = "OUT" if kind.startswith("O") else "IN"
+                    ent = {"t": float(self.sc.times[idx]), "kind": kind}
+                    src = m.get("src_idx", None)
+                    if src is not None:
+                        try:
+                            src_i = int(round(float(src)))
+                            if 0 <= src_i < self.T:
+                                ent["src_t"] = float(self.sc.times[src_i])
+                        except Exception:
+                            pass
+                    lst.append(ent)
+                if lst:
+                    out[int(ri)] = lst
+
+            return out
+
+        def closeEvent(self, ev):
+            try:
+                if self._cap is not None:
+                    self._cap.release()
+            except Exception:
+                pass
+            super().closeEvent(ev)
+
+        def keyPressEvent(self, ev):
+            # Navigation + edit hotkeys
+            key = ev.key()
+            mod = ev.modifiers()
+
+            if key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+                step = -1 if key == QtCore.Qt.Key_Left else +1
+                if mod & QtCore.Qt.ControlModifier:
+                    # prev/next marker (any)
+                    ri = self._cur_roi()
+                    ms = self._markers(ri)
+                    cur = int(self.sld.value())
+                    idxs = [int(m.get("idx", -1)) for m in ms]
+                    idxs = [i for i in idxs if i >= 0]
+                    if not idxs:
+                        return
+                    if step < 0:
+                        prev = [i for i in idxs if i < cur]
+                        if prev:
+                            self.sld.setValue(max(prev))
+                    else:
+                        nxt = [i for i in idxs if i > cur]
+                        if nxt:
+                            self.sld.setValue(min(nxt))
+                    return
+                if mod & QtCore.Qt.ShiftModifier:
+                    # prev/next IN
+                    ri = self._cur_roi()
+                    ms = [m for m in self._markers(ri) if str(m.get("kind","")).upper().startswith("I")]
+                    cur = int(self.sld.value())
+                    idxs = [int(m.get("idx", -1)) for m in ms if int(m.get("idx",-1)) >= 0]
+                    if not idxs:
+                        return
+                    if step < 0:
+                        prev = [i for i in idxs if i < cur]
+                        if prev:
+                            self.sld.setValue(max(prev))
+                    else:
+                        nxt = [i for i in idxs if i > cur]
+                        if nxt:
+                            self.sld.setValue(min(nxt))
+                    return
+                if mod & QtCore.Qt.AltModifier:
+                    # prev/next OUT
+                    ri = self._cur_roi()
+                    ms = [m for m in self._markers(ri) if str(m.get("kind","")).upper().startswith("O")]
+                    cur = int(self.sld.value())
+                    idxs = [int(m.get("idx", -1)) for m in ms if int(m.get("idx",-1)) >= 0]
+                    if not idxs:
+                        return
+                    if step < 0:
+                        prev = [i for i in idxs if i < cur]
+                        if prev:
+                            self.sld.setValue(max(prev))
+                    else:
+                        nxt = [i for i in idxs if i > cur]
+                        if nxt:
+                            self.sld.setValue(min(nxt))
+                    return
+
+                # plain left/right = per-frame scrub
+                self.sld.setValue(int(np.clip(int(self.sld.value()) + step, 0, max(0, self.T - 1))))
+                return
+
+            if key == QtCore.Qt.Key_Up:
+                self.sld.setValue(int(np.clip(int(self.sld.value()) - 10, 0, max(0, self.T - 1))))
+                return
+            if key == QtCore.Qt.Key_Down:
+                self.sld.setValue(int(np.clip(int(self.sld.value()) + 10, 0, max(0, self.T - 1))))
+                return
+
+            if key == QtCore.Qt.Key_I:
+                self._add_marker("IN")
+                return
+            if key == QtCore.Qt.Key_O:
+                self._add_marker("OUT")
+                return
+            if key == QtCore.Qt.Key_M:
+                self._merge_markers_nearby()
+                return
+            if key == QtCore.Qt.Key_Delete:
+                self._delete_selected()
+                return
+
+            super().keyPressEvent(ev)
+
+    # --------------------------------------------------------------------------------------------
+
+
 
     class VideoView(QtWidgets.QWidget):
         def __init__(self, ctrl):
