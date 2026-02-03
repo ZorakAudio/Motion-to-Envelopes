@@ -3415,6 +3415,189 @@ def flux_norm01(x, gamma=0.85, p_lo=5, p_hi=95):
         y = y**float(gamma)
     return y
 
+# --- PRETTY FLUX (export-time ADSR per marker phase) --------------------------
+# Enabled only when:
+#   - export preview supplies phase_markers_by_roi for this ROI
+#   - save_scene_csv_and_push(..., hard_write_flux_aoi=True)
+#
+# Goal:
+#   Use IN/OUT marker spacing as the "radius" and synthesize a clean envelope:
+#     Attack -> Decay -> Release  (piecewise eased curves)
+#   Scale per-phase amplitude by motion strength (percentile of flux_raw01).
+
+PRETTY_FLUX_ENABLE            = True
+
+# Fractions of each marker-to-marker phase span (they are normalized internally).
+PRETTY_FLUX_ATTACK_FRAC       = 0.22
+PRETTY_FLUX_DECAY_FRAC        = 0.53
+PRETTY_FLUX_RELEASE_FRAC      = 0.25
+
+# “Pretty tail” control:
+# After decay, the envelope does NOT slam to 0 immediately; it decays to MID,
+# then Release fades MID -> 0. Lower MID = snappier, higher MID = wetter tails.
+PRETTY_FLUX_MID_LEVEL         = 0.08
+
+# Curve exponents (higher = more eased / more “rounded”)
+PRETTY_FLUX_ATTACK_CURVE      = 1.35
+PRETTY_FLUX_DECAY_CURVE       = 1.85
+PRETTY_FLUX_RELEASE_CURVE     = 2.20
+
+# Per-phase strength comes from motion (0..1). Use a robust percentile so spikes
+# don’t dominate. Gamma < 1 expands mid dynamics; >1 compresses.
+PRETTY_FLUX_STRENGTH_PCTL     = 90.0
+PRETTY_FLUX_STRENGTH_GAMMA    = 0.85
+
+# Blend with measured flux_inner (0 = keep measured, 1 = full synthetic).
+PRETTY_FLUX_MIX               = 1.0
+
+# Tiny cosmetic blur to remove stairsteps (seconds). Keep small.
+PRETTY_FLUX_POST_BLUR_SEC     = 0.020
+
+
+def pretty_flux_adsr_from_markers01(
+    T: int,
+    markers,
+    fps: float,
+    *,
+    strength01=None,
+    attack_frac: float = PRETTY_FLUX_ATTACK_FRAC,
+    decay_frac: float = PRETTY_FLUX_DECAY_FRAC,
+    release_frac: float = PRETTY_FLUX_RELEASE_FRAC,
+    mid_level: float = PRETTY_FLUX_MID_LEVEL,
+    curve_attack: float = PRETTY_FLUX_ATTACK_CURVE,
+    curve_decay: float = PRETTY_FLUX_DECAY_CURVE,
+    curve_release: float = PRETTY_FLUX_RELEASE_CURVE,
+    strength_pctl: float = PRETTY_FLUX_STRENGTH_PCTL,
+    strength_gamma: float = PRETTY_FLUX_STRENGTH_GAMMA,
+    post_blur_sec: float = PRETTY_FLUX_POST_BLUR_SEC,
+):
+    import numpy as np
+
+    T = int(max(0, T))
+    out = np.zeros(T, np.float64)
+    if T <= 1 or not markers:
+        return out
+
+    # sanitize + sort markers
+    ms = []
+    for m in markers:
+        try:
+            idx = int(m.get("idx", -1))
+        except Exception:
+            continue
+        if idx < 0 or idx >= T:
+            continue
+        kind = str(m.get("kind", "IN")).upper()
+        kind = "OUT" if kind.startswith("O") else "IN"
+        ms.append({"idx": idx, "kind": kind})
+
+    if not ms:
+        return out
+
+    ms.sort(key=lambda z: int(z["idx"]))
+
+    # dedupe collisions: OUT wins
+    ded = []
+    for m in ms:
+        if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+            if m["kind"] == "OUT":
+                ded[-1] = m
+            continue
+        ded.append(m)
+
+    # collapse consecutive same-kind (they don’t create a useful boundary)
+    ms2 = []
+    for m in ded:
+        if ms2 and m["kind"] == ms2[-1]["kind"]:
+            continue
+        ms2.append(m)
+
+    if not ms2:
+        return out
+
+    # strength curve 0..1
+    s01 = None
+    if strength01 is not None:
+        s01 = np.asarray(strength01, np.float64)
+        if s01.size < T:
+            s01 = np.pad(s01, (0, T - s01.size), mode="edge")
+        else:
+            s01 = s01[:T]
+        s01 = np.clip(s01, 0.0, 1.0)
+
+    # normalize fractions
+    fs = float(attack_frac) + float(decay_frac) + float(release_frac)
+    if fs <= 1e-9:
+        return out
+    aF = float(attack_frac) / fs
+    dF = float(decay_frac) / fs
+    rF = float(release_frac) / fs
+
+    mid = float(np.clip(mid_level, 0.0, 1.0))
+    ca = float(max(1e-6, curve_attack))
+    cd = float(max(1e-6, curve_decay))
+    cr = float(max(1e-6, curve_release))
+
+    for i, m in enumerate(ms2):
+        a = int(m["idx"])
+        b = int(ms2[i + 1]["idx"]) if (i + 1) < len(ms2) else T
+        L = int(b - a)
+        if L <= 1:
+            continue
+
+        A = max(1, int(round(L * aF)))
+        D = max(1, int(round(L * dF)))
+        R = L - A - D
+
+        # ensure R >= 1 by stealing from D then A
+        if R < 1:
+            need = 1 - R
+            take = min(need, max(0, D - 1)); D -= take; need -= take
+            take = min(need, max(0, A - 1)); A -= take; need -= take
+            R = L - A - D
+            if R < 1:
+                # last resort
+                R = 1
+                if D > 1:
+                    D -= 1
+                elif A > 1:
+                    A -= 1
+
+        # Attack: 0 -> 1
+        ua = np.arange(A, dtype=np.float64) / float(max(1, A - 1))
+        segA = ua ** ca
+
+        # Decay: 1 -> mid
+        ud = np.arange(D, dtype=np.float64) / float(max(1, D - 1))
+        segD = mid + (1.0 - mid) * ((1.0 - ud) ** cd)
+
+        # Release: mid -> 0
+        ur = np.arange(R, dtype=np.float64) / float(max(1, R - 1))
+        segR = mid * ((1.0 - ur) ** cr)
+
+        seg = np.concatenate((segA, segD, segR), axis=0)[:L]
+
+        # scale by per-phase strength
+        if s01 is not None:
+            try:
+                amp = float(np.percentile(s01[a:b], float(strength_pctl)))
+            except Exception:
+                amp = float(np.max(s01[a:b]) if b > a else 1.0)
+            amp = float(np.clip(amp, 0.0, 1.0)) ** float(max(1e-6, strength_gamma))
+            seg = seg * amp
+
+        out[a:b] = np.clip(seg, 0.0, 1.0)
+
+    # normalize to a nice 0..1 range + tiny blur for cosmetics
+    out = flux_norm01(out, gamma=0.90, p_lo=1, p_hi=99)
+    if post_blur_sec and float(post_blur_sec) > 0.0:
+        sigma = max(1.0, float(post_blur_sec) * float(fps))
+        out = _gauss_blur1d(out, sigma)
+        out = np.clip(out, 0.0, 1.0)
+
+    return out
+
+
 # Goal:
 #   - preserve punchy attacks (instant attack)
 #   - prevent between-stroke collapse (slow/adaptive release)
@@ -9505,7 +9688,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -9935,20 +10118,39 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
         entropy_roi = normalize_unsigned01(_np.abs(res_ent))
 
-        # --- FLUX_SHAPE: offline, phase-conditioned release to 50% by next AoI flip ---
-        if FLUX_REL50_ENABLE:
-            flux_inner = flux_release_to_target_by_phase01(
-                flux_inner,
-                entropy_roi,
-                v_al,                 # you already computed v_al above (AoI axis velocity)
-                fps,
-                io_in_sign=int(getattr(r, "io_in_sign", +1)),
-                v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
-                target=float(FLUX_REL50_TARGET),
+        # --- FLUX_SHAPE ---------------------------------------------------------------
+        # If Hard-Write is enabled AND we have marker phases for this ROI,
+        # override Flux with a tempo-matched ADSR-like "pretty envelope" per phase span.
+        _override_markers = None
+        try:
+            if isinstance(phase_markers_by_roi, dict) and (ri in phase_markers_by_roi):
+                _override_markers = phase_markers_by_roi.get(ri) or None
+        except Exception:
+            _override_markers = None
+
+        if bool(PRETTY_FLUX_ENABLE) and bool(hard_write_flux_aoi) and _override_markers:
+            pretty = pretty_flux_adsr_from_markers01(
+                T, _override_markers, fps,
+                strength01=flux_raw01,   # 0..1 speed magnitude (already computed above)
             )
-        elif FLUX_LEAK_ENABLE:
-            # fallback to the older entropy-density leak model
-            flux_inner = flux_leaky_shape01(flux_inner, entropy_roi, fps)
+            mix = float(PRETTY_FLUX_MIX)
+            flux_inner = _np.clip((1.0 - mix) * flux_inner + mix * pretty, 0.0, 1.0)
+        else:
+            # legacy flux shaping (accuracy / measurement-based)
+            if FLUX_REL50_ENABLE:
+                flux_inner = flux_release_to_target_by_phase01(
+                    flux_inner,
+                    entropy_roi,
+                    v_al,                 # AoI axis velocity
+                    fps,
+                    io_in_sign=int(getattr(r, "io_in_sign", +1)),
+                    v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
+                    target=float(FLUX_REL50_TARGET),
+                )
+            elif FLUX_LEAK_ENABLE:
+                flux_inner = flux_leaky_shape01(flux_inner, entropy_roi, fps)
+        # --- END FLUX_SHAPE -----------------------------------------------------------
+
         # --- END FLUX_SHAPE ---
 
         # --- END FLUX_LEAK ---
@@ -11771,6 +11973,7 @@ def run_qt(video_path):
                     export_live_lp_hz=float(export_cfg.get('export_live_lp_hz', 0.0)),
                     export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps', 0.0)),
                     phase_markers_by_roi=phase_markers,
+                    hard_write_flux_aoi=bool(opts.get("hard_write_flux_aoi", False)),
                 )
             else:
                 # No preview: manual push remains OFF unless explicitly enabled.
