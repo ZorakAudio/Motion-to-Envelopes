@@ -9688,7 +9688,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -10110,6 +10110,10 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             p_hi=95
         )
 
+        # Keep a copy of the measured Flux before any Hard-write override.
+        flux_measured = flux_inner.copy()
+
+
         # --- Entropy lane: high-freq residual of speed_s ---
         # Slow trend over ~0.35 s
         sigma_ent = max(1.0, 0.35 * fps)
@@ -10133,8 +10137,18 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                 T, _override_markers, fps,
                 strength01=flux_raw01,   # 0..1 speed magnitude (already computed above)
             )
+
+            # 1) Master pretty mix (macro replacement). Usually 1.0.
             mix = float(PRETTY_FLUX_MIX)
-            flux_inner = _np.clip((1.0 - mix) * flux_inner + mix * pretty, 0.0, 1.0)
+            mix = max(0.0, min(1.0, mix))
+            base = _np.clip((1.0 - mix) * flux_measured + mix * pretty, 0.0, 1.0)
+
+            # 2) Measured bleed-through (micro timing cues / jitter). 0..1.
+            bleed = float(flux_measured_bleed)  # from UI or default
+            bleed = max(0.0, min(1.0, bleed))
+
+            flux_inner = _np.clip((1.0 - bleed) * base + bleed * flux_measured, 0.0, 1.0)
+
         else:
             # legacy flux shaping (accuracy / measurement-based)
             if FLUX_REL50_ENABLE:
@@ -11974,6 +11988,7 @@ def run_qt(video_path):
                     export_live_deadband_ps=float(export_cfg.get('export_live_deadband_ps', 0.0)),
                     phase_markers_by_roi=phase_markers,
                     hard_write_flux_aoi=bool(opts.get("hard_write_flux_aoi", False)),
+                    flux_measured_bleed=float(opts.get("flux_measured_bleed", 0.15)),
                 )
             else:
                 # No preview: manual push remains OFF unless explicitly enabled.
@@ -14034,6 +14049,38 @@ def run_qt(video_path):
             self.chk_hard = QtWidgets.QCheckBox("Hard-write Flux/AoI (stronger re-timing)")
             self.chk_pos  = QtWidgets.QCheckBox("Also warp center (cx/cy)")
             self.chk_sign = QtWidgets.QCheckBox("Enforce AoI IN/OUT sign by marker phase")
+            # --- NEW: how much measured Flux bleeds through in Hard-write mode ---
+            self.lbl_flux_bleed = QtWidgets.QLabel("Measured Flux bleed: 15%")
+            self.lbl_flux_bleed.setToolTip(
+                "0% = fully synthetic pretty envelope\n"
+                "15–30% = adds measured micro-timing cues (often improves felt sync)\n"
+                "100% = fully measured Flux (maximum jitter / realism)"
+            )
+
+            self.sld_flux_bleed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_bleed.setRange(0, 100)
+
+            # restore from saved opts if available
+            _saved = self._saved_opts if isinstance(getattr(self, "_saved_opts", None), dict) else {}
+            _default_bleed = float(_saved.get("flux_measured_bleed", 0.15))
+
+            self.sld_flux_bleed.setValue(int(round(100.0 * max(0.0, min(1.0, _default_bleed)))))
+
+            row_bleed = QtWidgets.QHBoxLayout()
+            row_bleed.addWidget(self.lbl_flux_bleed)
+            row_bleed.addWidget(self.sld_flux_bleed, 1)
+            opt.addLayout(row_bleed)
+
+            def _bleed_changed(v):
+                self.lbl_flux_bleed.setText(f"Measured Flux bleed: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
+            self.sld_flux_bleed.valueChanged.connect(_bleed_changed)
+            _bleed_changed(self.sld_flux_bleed.value())
+
 
             opt.addWidget(self.chk_apply)
             opt.addWidget(self.chk_warp)
@@ -14784,6 +14831,8 @@ def run_qt(video_path):
                 "warp_positions": bool(self.chk_pos.isChecked()),
                 "enforce_aoi_sign": bool(self.chk_sign.isChecked()),
                 "hard_write_flux_aoi": bool(self.chk_hard.isChecked()),
+                "flux_measured_bleed": float(self.sld_flux_bleed.value()) / 100.0,
+
             }
 
             # markers per roi
