@@ -8,12 +8,14 @@ import os, sys, json, csv, math, time, re, base64, hashlib, textwrap, pickle, zl
 from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Optional, Dict, Any
 import threading
+from collections import OrderedDict
 
 
 import numpy as np
 import cv2 as cv
 import pandas as pd
 import time, math, os
+
 
 
 APP_NAME = "Local Motion Tracker"
@@ -7723,6 +7725,43 @@ def _build_timewarp_map(T: int, markers) -> np.ndarray:
     grid = np.arange(T, dtype=np.float64)
     return np.interp(grid, np.asarray(dst2, np.float64), np.asarray(src2, np.float64))
 
+def _warp_velocity_scale(map_src: np.ndarray,
+                         *,
+                         clamp_lo: float = 0.25,
+                         clamp_hi: float = 4.0,
+                         smooth_sigma: float = 1.5) -> np.ndarray:
+    """
+    Local time-warp slope (d src / d dst) used to scale velocities so that
+    stretch/compress behaves like a time reparameterization of the same path.
+
+    - map_src: target_index -> source_index (monotone)
+    - returns: per-frame scale factor (>=0)
+    """
+    ms = np.asarray(map_src, np.float64)
+    T = int(ms.size)
+    if T <= 1:
+        return np.ones(T, np.float64)
+
+    d = np.diff(ms)
+    if d.size:
+        d = np.concatenate([d, d[-1:]])
+    else:
+        d = np.ones(T, np.float64)
+
+    # guard: non-positive slopes -> 1.0
+    d = np.where(d > 1e-6, d, 1.0)
+    d = np.clip(d, float(clamp_lo), float(clamp_hi))
+
+    try:
+        sig = float(smooth_sigma)
+        if sig > 0.0 and T >= 5:
+            d = _gauss_blur1d(d, sig)
+            d = np.clip(d, float(clamp_lo), float(clamp_hi))
+    except Exception:
+        pass
+
+    return d.astype(np.float64)
+
 
 def _warp_1d(series, map_src: np.ndarray) -> np.ndarray:
     series = np.asarray(series if series is not None else [], np.float64)
@@ -7803,7 +7842,9 @@ def apply_export_marker_corrections(sc: "Scene",
                                    *,
                                    warp_motion: bool = True,
                                    warp_positions: bool = True,
-                                   enforce_aoi_sign: bool = True) -> "Scene":
+                                   enforce_aoi_sign: bool = True,
+                                   hard_write_flux_aoi: bool = False) -> "Scene":
+
     """
     Produce an export-only corrected scene:
       - optional time-warp to move motion features onto edited markers
@@ -7854,6 +7895,13 @@ def apply_export_marker_corrections(sc: "Scene",
             vx = _warp_1d(vx, map_src)
             vy = _warp_1d(vy, map_src)
             vz = _warp_1d(vz, map_src)
+
+        if hard_write_flux_aoi and map_src is not None:
+            scale = _warp_velocity_scale(map_src, smooth_sigma=max(1.0, 0.02*float(fps)))
+            vx = vx * scale
+            vy = vy * scale
+            vz = vz * scale
+
 
         if enforce_aoi_sign:
             vx, vy, vz = _enforce_aoi_sign_by_markers(vx, vy, vz, roi, fps, markers)
@@ -11709,7 +11757,9 @@ def run_qt(video_path):
                         warp_motion=bool(opts.get("warp_motion", True)),
                         warp_positions=bool(opts.get("warp_positions", True)),
                         enforce_aoi_sign=bool(opts.get("enforce_aoi_sign", True)),
+                        hard_write_flux_aoi=bool(opts.get("hard_write_flux_aoi", False)),
                     )
+
                     phase_markers = markers_by_roi
 
                 sc_for_ai = sc_out
@@ -13600,6 +13650,45 @@ def run_qt(video_path):
             self.fps = float(fps)
             self.W = int(W)
             self.H = int(H)
+            # ---- FAST export preview tuning ----
+            # Lower max width = faster scrubbing (480 = extremely snappy, 640 = good balance)
+            self._pv_max_w = 640
+            self._pv_cache_max = 180       # frames cached (180 * ~640x360x3 ~= ~140MB worst-case)
+            self._pv_live_drag = True      # False = fastest (only updates on slider release)
+
+            # preview size is derived from processing scale (self.W/self.H)
+            self._pv_scale = min(1.0, float(self._pv_max_w) / max(1.0, float(self.W)))
+            self._pvW = max(64, int(round(self.W * self._pv_scale)))
+            self._pvH = max(64, int(round(self.H * self._pv_scale)))
+            self._pv_sx = self._pvW / float(self.W) if self.W else 1.0
+            self._pv_sy = self._pvH / float(self.H) if self.H else 1.0
+
+            # LRU cache: frame_idx -> BGR image at preview size
+            self._pv_cache = OrderedDict()
+            self._pv_dec_pos = -1                  # last decoded frame index in self._cap
+            self._pv_pending_sample_idx = None
+            self._pv_busy = False
+
+            # Qt image formats (PyQt5 vs PySide6 compat)
+            self._qt_fmt_bgr = getattr(QtGui.QImage, "Format_BGR888", None)
+            if self._qt_fmt_bgr is None:
+                try:
+                    self._qt_fmt_bgr = QtGui.QImage.Format.Format_BGR888
+                except Exception:
+                    self._qt_fmt_bgr = None
+
+            self._qt_fmt_rgb = getattr(QtGui.QImage, "Format_RGB888", None)
+            if self._qt_fmt_rgb is None:
+                try:
+                    self._qt_fmt_rgb = QtGui.QImage.Format.Format_RGB888
+                except Exception:
+                    self._qt_fmt_rgb = None
+
+            # Throttle preview decoding (cap rate ~30Hz while dragging)
+            self._pv_timer = QtCore.QTimer(self)
+            self._pv_timer.setInterval(33)  # 30 fps cap
+            self._pv_timer.timeout.connect(self._flush_preview_request)
+
             self.sc_src = sc_src
 
             self._push = False
@@ -13659,7 +13748,7 @@ def run_qt(video_path):
             split.addLayout(left, 2)
 
             self.lbl_frame = QtWidgets.QLabel()
-            self.lbl_frame.setMinimumSize(480, 270)
+            self.lbl_frame.setFixedSize(self._pvW, self._pvH)   # fixed = no per-frame Qt scaling
             self.lbl_frame.setAlignment(QtCore.Qt.AlignCenter)
             self.lbl_frame.setStyleSheet("background: #111; border: 1px solid #333;")
             left.addWidget(self.lbl_frame, 5)
@@ -13671,6 +13760,9 @@ def run_qt(video_path):
             self.sld.setMinimum(0)
             self.sld.setMaximum(max(0, self.T - 1))
             self.sld.setValue(0)
+            self.sld.setTracking(bool(self._pv_live_drag))
+            self.sld.sliderReleased.connect(lambda: self._request_frame_preview(self.sld.value(), immediate=True))
+
             scrub.addWidget(self.sld, 1)
             self.lbl_t = QtWidgets.QLabel("t=0.000s  idx=0")
             self.lbl_t.setStyleSheet("color: #c0c0c0;")
@@ -13702,20 +13794,26 @@ def run_qt(video_path):
             self.btn_add_in = QtWidgets.QPushButton("Add IN (I)")
             self.btn_add_out = QtWidgets.QPushButton("Add OUT (O)")
             self.btn_del = QtWidgets.QPushButton("Delete (Del)")
+            self.btn_del_all = QtWidgets.QPushButton("Delete All")
 
-            # NEW: merge/simplify dense markers (micro-chatter killer)
+
+            # Merge helpers (kills micro-phases)
+            merge_row = QtWidgets.QHBoxLayout()
+            right.addLayout(merge_row)
+            merge_row.addWidget(QtWidgets.QLabel("Merge tiny phases <"))
             self.spn_merge_ms = QtWidgets.QSpinBox()
-            self.spn_merge_ms.setRange(10, 2000)
+            self.spn_merge_ms.setRange(0, 2000)
             self.spn_merge_ms.setValue(120)
-            self.spn_merge_ms.setToolTip("Merge markers closer than this many milliseconds (per ROI).")
-
-            self.btn_merge = QtWidgets.QPushButton("Merge (M)")
-            self.btn_merge.setToolTip("Collapse dense IN/OUT chatter into fewer boundaries.\n"
-                                    "Uses Flux as a strength curve and avoids deleting edited markers.")
+            self.spn_merge_ms.setSuffix(" ms")
+            merge_row.addWidget(self.spn_merge_ms)
+            self.btn_merge = QtWidgets.QPushButton("Merge")
+            merge_row.addWidget(self.btn_merge)
+            merge_row.addStretch(1)
 
             tools.addWidget(self.btn_add_in)
             tools.addWidget(self.btn_add_out)
             tools.addWidget(self.btn_del)
+            tools.addWidget(self.btn_del_all)
             tools.addSpacing(12)
             tools.addWidget(QtWidgets.QLabel("Merge ≤ ms:"))
             tools.addWidget(self.spn_merge_ms)
@@ -13730,13 +13828,16 @@ def run_qt(video_path):
 
             self.chk_apply = QtWidgets.QCheckBox("Apply corrections from markers on export")
             self.chk_warp = QtWidgets.QCheckBox("Time-warp (stretch/compress) between markers")
+            self.chk_hard = QtWidgets.QCheckBox("Hard-write Flux/AoI (stronger re-timing)")
             self.chk_pos  = QtWidgets.QCheckBox("Also warp center (cx/cy)")
             self.chk_sign = QtWidgets.QCheckBox("Enforce AoI IN/OUT sign by marker phase")
 
             opt.addWidget(self.chk_apply)
             opt.addWidget(self.chk_warp)
+            opt.addWidget(self.chk_hard)
             opt.addWidget(self.chk_pos)
             opt.addWidget(self.chk_sign)
+
 
             # defaults
             has_saved_any = bool(self._saved_time_by_roi)
@@ -13744,11 +13845,15 @@ def run_qt(video_path):
             self.chk_warp.setChecked(True)
             self.chk_pos.setChecked(True)
             self.chk_sign.setChecked(True)
+            self.chk_hard.setChecked(False)
+
             if isinstance(self._saved_opts, dict):
                 self.chk_apply.setChecked(bool(self._saved_opts.get("apply", self.chk_apply.isChecked())))
                 self.chk_warp.setChecked(bool(self._saved_opts.get("warp_motion", True)))
                 self.chk_pos.setChecked(bool(self._saved_opts.get("warp_positions", True)))
                 self.chk_sign.setChecked(bool(self._saved_opts.get("enforce_aoi_sign", True)))
+                self.chk_hard.setChecked(bool(self._saved_opts.get("hard_write_flux_aoi", False)))
+
 
             # buttons
             btns = QtWidgets.QHBoxLayout()
@@ -13777,6 +13882,10 @@ def run_qt(video_path):
             self.btn_cancel.clicked.connect(self.reject)
             self.btn_export.clicked.connect(self._accept_export_csv)
             self.btn_push.clicked.connect(self._accept_export_push)
+            self.btn_del_all.clicked.connect(self._delete_all)
+            self.btn_merge.clicked.connect(self._merge_markers)
+            self.chk_hard.toggled.connect(self._update_preview)
+
 
             # init view
             self._on_roi_changed()
@@ -13971,17 +14080,17 @@ def run_qt(video_path):
                 if 0 <= r < len(ms):
                     self.sld.setValue(int(ms[r]["idx"]))
 
-        def _on_scrub(self, idx):
+        def _on_scrub(self, idx: int):
             idx = int(np.clip(int(idx), 0, max(0, self.T - 1)))
-            if self.T > 0:
-                try:
-                    t = float(self.sc.times[idx])
-                except Exception:
-                    t = 0.0
-                self.lbl_t.setText(f"t={t:.3f}s  idx={idx}")
-            else:
-                self.lbl_t.setText("t=—  idx=—")
-            self._update_frame_preview(idx)
+            try:
+                t = float(self.sc.times[idx])
+            except Exception:
+                t = 0.0
+            self.lbl_t.setText(f"t={t:0.3f}s  idx={idx}")
+
+            # Don’t decode immediately on every tick; queue it
+            self._request_frame_preview(idx, immediate=(not bool(getattr(self, "_pv_live_drag", True))))
+
 
         def _selected_row(self) -> int:
             rows = self.tbl.selectionModel().selectedRows()
@@ -14035,6 +14144,81 @@ def run_qt(video_path):
             self._set_dirty(ri, True)
             self._rebuild_table()
             self._update_preview()
+
+        def _delete_all(self):
+            ri = self._cur_roi()
+            if not (self._markers_by_roi or {}).get(ri):
+                return
+            self._markers_by_roi[ri] = []
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._update_preview()
+
+        def _merge_markers(self):
+            ri = self._cur_roi()
+            ms = list(self._markers(ri))
+            if len(ms) < 2:
+                return
+
+            try:
+                min_ms = int(self.spn_merge_ms.value())
+            except Exception:
+                min_ms = 120
+
+            min_gap = max(1, int(round(float(min_ms) * float(self.fps) / 1000.0)))
+            T = int(self.T)
+
+            # normalize + sort
+            ms = sorted(ms, key=lambda m: int(m.get("idx", 0)))
+            for m in ms:
+                k = str(m.get("kind", "IN") or "IN").upper()
+                m["kind"] = "OUT" if k.startswith("O") else "IN"
+
+            def _collapse_same_kind(seq):
+                out = []
+                for m in seq:
+                    if out and out[-1]["kind"] == m["kind"]:
+                        continue
+                    out.append(m)
+                return out
+
+            ms2 = _collapse_same_kind(ms)
+
+            # Drop markers that create tiny phases (< min_gap frames).
+            # Policy: remove the marker that STARTS the tiny phase (merge into previous).
+            changed = True
+            while changed and len(ms2) >= 1:
+                changed = False
+                ms2 = _collapse_same_kind(ms2)
+
+                removed = False
+                for i in range(len(ms2) - 1):
+                    a = int(ms2[i].get("idx", 0))
+                    b = int(ms2[i + 1].get("idx", 0))
+                    if (b - a) < min_gap:
+                        del ms2[i]
+                        changed = True
+                        removed = True
+                        break
+                if removed:
+                    continue
+
+                # Also merge a tiny trailing phase (last marker to end)
+                if ms2:
+                    last_len = T - int(ms2[-1].get("idx", 0))
+                    if last_len < min_gap:
+                        ms2.pop(-1)
+                        changed = True
+
+            # re-id
+            for i, m in enumerate(ms2):
+                m["id"] = int(i)
+
+            self._markers_by_roi[ri] = ms2
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._update_preview()
+
 
         def _merge_markers_nearby(self):
             ri = self._cur_roi()
@@ -14169,6 +14353,13 @@ def run_qt(video_path):
                     vy = _warp_1d(vy, mp)
                     vz = _warp_1d(vz, mp)
 
+                    if self.chk_hard.isChecked():
+                        scale = _warp_velocity_scale(mp, smooth_sigma=max(1.0, 0.02*float(self.fps)))
+                        vx = vx * scale
+                        vy = vy * scale
+                        vz = vz * scale
+
+
                 if self.chk_sign.isChecked():
                     vx, vy, vz = _enforce_aoi_sign_by_markers(vx, vy, vz, self.sc.rois[ri], self.fps, markers)
 
@@ -14203,6 +14394,85 @@ def run_qt(video_path):
             dirty = bool(self._dirty_by_roi.get(ri, False))
             self.lbl_status.setText(f"markers={len(ms)}  dirty={dirty}  apply={self.chk_apply.isChecked()}")
 
+        def _pv_cache_get(self, frame_idx: int):
+            fr = self._pv_cache.get(frame_idx, None)
+            if fr is not None:
+                try:
+                    self._pv_cache.move_to_end(frame_idx)
+                except Exception:
+                    pass
+            return fr
+
+        def _pv_cache_put(self, frame_idx: int, frame_small_bgr):
+            self._pv_cache[frame_idx] = frame_small_bgr
+            try:
+                self._pv_cache.move_to_end(frame_idx)
+            except Exception:
+                pass
+            # LRU trim
+            while len(self._pv_cache) > int(getattr(self, "_pv_cache_max", 180)):
+                try:
+                    self._pv_cache.popitem(last=False)
+                except Exception:
+                    break
+
+        def _pv_read_frame(self, target_idx: int):
+            """
+            Fast read:
+              - if next frame, just read (no seek)
+              - else, one random seek then read
+            Mirrors Controller._read_frame optimization.:contentReference[oaicite:4]{index=4}
+            """
+            try:
+                if self._pv_dec_pos + 1 == target_idx:
+                    ok, fr = self._cap.read()
+                    if ok:
+                        self._pv_dec_pos = target_idx
+                        return True, fr
+                self._cap.set(cv.CAP_PROP_POS_FRAMES, int(target_idx))
+                ok, fr = self._cap.read()
+                if ok:
+                    self._pv_dec_pos = int(target_idx)
+                return ok, fr
+            except Exception:
+                return False, None
+
+        def _request_frame_preview(self, sample_idx: int, immediate: bool = False):
+            if self.T <= 0:
+                return
+            sample_idx = int(np.clip(int(sample_idx), 0, max(0, self.T - 1)))
+            self._pv_pending_sample_idx = sample_idx
+
+            if immediate:
+                if self._pv_timer.isActive():
+                    self._pv_timer.stop()
+                self._flush_preview_request()
+                return
+
+            if not self._pv_timer.isActive():
+                self._pv_timer.start()
+
+        def _flush_preview_request(self):
+            if getattr(self, "_pv_busy", False):
+                return
+
+            idx = getattr(self, "_pv_pending_sample_idx", None)
+            if idx is None:
+                if self._pv_timer.isActive():
+                    self._pv_timer.stop()
+                return
+
+            self._pv_pending_sample_idx = None
+            self._pv_busy = True
+            try:
+                self._update_frame_preview(int(idx))
+            finally:
+                self._pv_busy = False
+
+            # stop timer when there’s nothing queued
+            if self._pv_pending_sample_idx is None and self._pv_timer.isActive():
+                self._pv_timer.stop()
+
         # ---------------- frame preview ----------------
         def _update_frame_preview(self, sample_idx: int):
             if self._cap is None or self.T <= 0:
@@ -14216,51 +14486,76 @@ def run_qt(video_path):
                 t = 0.0
             frame_idx = int(round(t * self.fps))
 
-            try:
-                self._cap.set(cv.CAP_PROP_POS_FRAMES, max(0, frame_idx))
-                ok, frame = self._cap.read()
-            except Exception:
-                ok, frame = False, None
+            # ---- base frame from cache or decode ----
+            base = self._pv_cache_get(frame_idx)
+            if base is None:
+                ok, fr = self._pv_read_frame(max(0, frame_idx))
+                if not ok or fr is None:
+                    self.lbl_frame.setText("(frame read failed)")
+                    return
 
-            if not ok or frame is None:
-                self.lbl_frame.setText("(frame read failed)")
-                return
+                # ONE resize total: decode -> preview size (skip resize-to-processing-scale)
+                if getattr(self, "_pv_scale", 1.0) != 1.0:
+                    try:
+                        fr = cv.resize(fr, (self._pvW, self._pvH), interpolation=cv.INTER_AREA)
+                    except Exception:
+                        pass
 
-            # match processing scale
-            try:
-                frame = cv.resize(frame, (self.W, self.H), interpolation=cv.INTER_AREA)
-            except Exception:
-                pass
+                base = fr
+                self._pv_cache_put(frame_idx, base)
 
-            ri = self._cur_roi()
-            r = self.sc.rois[ri]
+            # draw overlay on a copy (keep cache clean)
             try:
-                x, y, w, h = [int(v) for v in getattr(r, "bbox", (0, 0, 0, 0))]
+                vis = base.copy()
             except Exception:
-                x, y, w, h = 0, 0, 0, 0
+                vis = base
+
+            # ---- ROI rect (processing coords -> preview coords) ----
+            ri = -1
+            try:
+                ri = self._cur_roi()
+                r = self.sc.rois[ri]
+                bbox = getattr(r, "bbox", None)
+                if bbox is None:
+                    bbox = getattr(r, "rect", (0, 0, 0, 0))
+                x, y, w, h = [int(v) for v in bbox]
+            except Exception:
+                x = y = w = h = 0
+
             if w > 0 and h > 0:
-                cv.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 255), 2)
+                sx, sy = float(self._pv_sx), float(self._pv_sy)
+                x2 = int(round(x * sx)); y2 = int(round(y * sy))
+                w2 = int(round(w * sx)); h2 = int(round(h * sy))
+                cv.rectangle(vis, (x2, y2), (x2 + w2, y2 + h2), (0, 220, 255), 2)
 
-            # draw tracked center if present
+            # ---- tracked center (processing coords -> preview coords) ----
             try:
-                cx = self.sc.roi_cx.get(ri, [])
-                cy = self.sc.roi_cy.get(ri, [])
-                if cx and cy and sample_idx < len(cx) and sample_idx < len(cy):
-                    px = int(round(float(cx[sample_idx])))
-                    py = int(round(float(cy[sample_idx])))
-                    cv.circle(frame, (px, py), 4, (255, 255, 255), -1)
+                if ri >= 0:
+                    cx = self.sc.roi_cx.get(ri, [])
+                    cy = self.sc.roi_cy.get(ri, [])
+                    if cx and cy and sample_idx < len(cx) and sample_idx < len(cy):
+                        sx, sy = float(self._pv_sx), float(self._pv_sy)
+                        px = int(round(float(cx[sample_idx]) * sx))
+                        py = int(round(float(cy[sample_idx]) * sy))
+                        cv.circle(vis, (px, py), 3, (255, 255, 255), -1)
             except Exception:
                 pass
 
-            # render to Qt
+            # ---- Qt render (BGR direct if available; else fallback to RGB) ----
             try:
-                rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                h, w, _ = rgb.shape
-                qimg = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
-                self.lbl_frame.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
-                    self.lbl_frame.width(), self.lbl_frame.height(),
-                    QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-                ))
+                h, w = vis.shape[:2]
+                bpl = int(vis.strides[0])
+
+                if getattr(self, "_qt_fmt_bgr", None) is not None:
+                    qimg = QtGui.QImage(vis.data, w, h, bpl, self._qt_fmt_bgr).copy()
+                else:
+                    rgb = cv.cvtColor(vis, cv.COLOR_BGR2RGB)
+                    h, w = rgb.shape[:2]
+                    bpl = int(rgb.strides[0])
+                    qimg = QtGui.QImage(rgb.data, w, h, bpl, self._qt_fmt_rgb).copy()
+
+                # No scaling here; label is fixed-size to match preview dims
+                self.lbl_frame.setPixmap(QtGui.QPixmap.fromImage(qimg))
             except Exception:
                 self.lbl_frame.setText("(render failed)")
 
@@ -14285,6 +14580,7 @@ def run_qt(video_path):
                 "warp_motion": bool(self.chk_warp.isChecked()),
                 "warp_positions": bool(self.chk_pos.isChecked()),
                 "enforce_aoi_sign": bool(self.chk_sign.isChecked()),
+                "hard_write_flux_aoi": bool(self.chk_hard.isChecked()),
             }
 
             # markers per roi
