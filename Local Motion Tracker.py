@@ -3597,6 +3597,70 @@ def pretty_flux_adsr_from_markers01(
 
     return out
 
+def pretty_flux_adsr_with_onset_snap01(
+    T: int,
+    markers,
+    fps: float,
+    *,
+    strength01=None,
+    onset_snap01: float = 0.0,
+) -> "np.ndarray":
+    """
+    Layer B: your existing pretty ADSR.
+    Layer A: a faster-attack variant to reduce perceptual lag at marker edges.
+    onset_snap01 blends B -> max(B, A).
+      0.0 = only Layer B
+      1.0 = full onset snap (use max(B, A))
+    """
+    import numpy as _np
+
+    T = int(T)
+    if T <= 1 or not markers:
+        return _np.zeros(max(0, T), _np.float64)
+
+    o = 0.0
+    try:
+        o = float(onset_snap01)
+    except Exception:
+        o = 0.0
+    o = max(0.0, min(1.0, o))
+
+    pretty_B = pretty_flux_adsr_from_markers01(
+        T, markers, fps,
+        strength01=strength01,
+        attack_frac=PRETTY_FLUX_ATTACK_FRAC,
+        curve_attack=PRETTY_FLUX_ATTACK_CURVE,
+        decay_frac=PRETTY_FLUX_DECAY_FRAC,
+        curve_decay=PRETTY_FLUX_DECAY_CURVE,
+        release_frac=PRETTY_FLUX_RELEASE_FRAC,
+        curve_release=PRETTY_FLUX_RELEASE_CURVE,
+        mid_level=PRETTY_FLUX_MID_LEVEL,
+    )
+
+    if o <= 1e-6:
+        return _np.clip(pretty_B, 0.0, 1.0)
+
+    # --- Layer A: fast-attack onset snap ---
+    # Attack is shorter + more "front-loaded" curve.
+    attack_fast = max(0.02, float(PRETTY_FLUX_ATTACK_FRAC) * 0.35)
+    curve_attack_fast = min(1.0, float(PRETTY_FLUX_ATTACK_CURVE) * 0.55)
+
+    pretty_A = pretty_flux_adsr_from_markers01(
+        T, markers, fps,
+        strength01=strength01,
+        attack_frac=attack_fast,
+        curve_attack=curve_attack_fast,
+        decay_frac=PRETTY_FLUX_DECAY_FRAC,
+        curve_decay=PRETTY_FLUX_DECAY_CURVE,
+        release_frac=PRETTY_FLUX_RELEASE_FRAC,
+        curve_release=PRETTY_FLUX_RELEASE_CURVE,
+        mid_level=PRETTY_FLUX_MID_LEVEL,
+    )
+
+    pretty_AB = _np.maximum(pretty_B, pretty_A)
+    out = (1.0 - o) * pretty_B + o * pretty_AB
+    return _np.clip(out, 0.0, 1.0)
+
 
 # Goal:
 #   - preserve punchy attacks (instant attack)
@@ -9688,7 +9752,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15, flux_pretty_mix: float = 1.0, flux_onset_snap: float = 0.0):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -10124,7 +10188,7 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
         # --- FLUX_SHAPE ---------------------------------------------------------------
         # If Hard-Write is enabled AND we have marker phases for this ROI,
-        # override Flux with a tempo-matched ADSR-like "pretty envelope" per phase span.
+        # we can override Flux with a tempo-matched ADSR-like "pretty envelope" per phase span.
         _override_markers = None
         try:
             if isinstance(phase_markers_by_roi, dict) and (ri in phase_markers_by_roi):
@@ -10132,22 +10196,58 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         except Exception:
             _override_markers = None
 
-        if bool(PRETTY_FLUX_ENABLE) and bool(hard_write_flux_aoi) and _override_markers:
-            pretty = pretty_flux_adsr_from_markers01(
-                T, _override_markers, fps,
-                strength01=flux_raw01,   # 0..1 speed magnitude (already computed above)
+        # 0) FIRST: compute "measured final" exactly like the non-hard-write path
+        flux_measured_final = flux_inner
+        if FLUX_REL50_ENABLE:
+            flux_measured_final = flux_release_to_target_by_phase01(
+                flux_measured_final,
+                entropy_roi,
+                v_al,
+                fps,
+                io_in_sign=int(getattr(r, "io_in_sign", +1)),
+                v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
+                target=float(FLUX_REL50_TARGET),
             )
+        elif FLUX_LEAK_ENABLE:
+            flux_measured_final = flux_leaky_shape01(flux_measured_final, entropy_roi, fps)
+        flux_measured_final = _np.clip(flux_measured_final, 0.0, 1.0)
 
-            # 1) Master pretty mix (macro replacement). Usually 1.0.
-            mix = float(PRETTY_FLUX_MIX)
+        # Default output (no hard write): measured final
+        flux_inner = flux_measured_final
+
+        # 1) Hard-write pretty override (Layer B + optional Layer A onset snap)
+        if bool(PRETTY_FLUX_ENABLE) and bool(hard_write_flux_aoi) and _override_markers:
+            # Clamp UI args
+            try:
+                mix = float(flux_pretty_mix)
+            except Exception:
+                mix = float(PRETTY_FLUX_MIX)
             mix = max(0.0, min(1.0, mix))
-            base = _np.clip((1.0 - mix) * flux_measured + mix * pretty, 0.0, 1.0)
 
-            # 2) Measured bleed-through (micro timing cues / jitter). 0..1.
-            bleed = float(flux_measured_bleed)  # from UI or default
+            try:
+                onset = float(flux_onset_snap)
+            except Exception:
+                onset = 0.0
+            onset = max(0.0, min(1.0, onset))
+
+            try:
+                bleed = float(flux_measured_bleed)
+            except Exception:
+                bleed = 0.15
             bleed = max(0.0, min(1.0, bleed))
 
-            flux_inner = _np.clip((1.0 - bleed) * base + bleed * flux_measured, 0.0, 1.0)
+            pretty = pretty_flux_adsr_with_onset_snap01(
+                T, _override_markers, fps,
+                strength01=flux_raw01,     # already computed above
+                onset_snap01=onset,        # NEW
+            )
+
+            # Macro blend: measured_final <-> pretty
+            base = _np.clip((1.0 - mix) * flux_measured_final + mix * pretty, 0.0, 1.0)
+
+            # Micro bleed: measured_final leaked back in (detail/jitter)
+            flux_inner = _np.clip((1.0 - bleed) * base + bleed * flux_measured_final, 0.0, 1.0)
+
 
         else:
             # legacy flux shaping (accuracy / measurement-based)
@@ -11989,6 +12089,9 @@ def run_qt(video_path):
                     phase_markers_by_roi=phase_markers,
                     hard_write_flux_aoi=bool(opts.get("hard_write_flux_aoi", False)),
                     flux_measured_bleed=float(opts.get("flux_measured_bleed", 0.15)),
+                    flux_pretty_mix=float(opts.get("flux_pretty_mix", PRETTY_FLUX_MIX)),
+                    flux_onset_snap=float(opts.get("flux_onset_snap", 0.0)),
+
                 )
             else:
                 # No preview: manual push remains OFF unless explicitly enabled.
@@ -14049,27 +14152,70 @@ def run_qt(video_path):
             self.chk_hard = QtWidgets.QCheckBox("Hard-write Flux/AoI (stronger re-timing)")
             self.chk_pos  = QtWidgets.QCheckBox("Also warp center (cx/cy)")
             self.chk_sign = QtWidgets.QCheckBox("Enforce AoI IN/OUT sign by marker phase")
-            # --- NEW: how much measured Flux bleeds through in Hard-write mode ---
+            
+            # --- Flux shaping in Hard-write mode -------------------------------------------
+            # (A) Pretty mix: macro replacement (0% measured .. 100% pretty)
+            self.lbl_flux_mix = QtWidgets.QLabel("Pretty mix: 100%")
+            self.lbl_flux_mix.setToolTip(
+                "Macro blend between measured Flux and the synthetic 'pretty' ADSR envelope.\n"
+                "0% = fully measured Flux\n"
+                "100% = fully pretty envelope\n"
+                "Use Bleed for micro timing cues."
+            )
+            self.sld_flux_mix = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_mix.setRange(0, 100)
+
+            # (B) Measured bleed-through: micro timing cues / jitter layered back in
             self.lbl_flux_bleed = QtWidgets.QLabel("Measured Flux bleed: 15%")
             self.lbl_flux_bleed.setToolTip(
-                "0% = fully synthetic pretty envelope\n"
-                "15–30% = adds measured micro-timing cues (often improves felt sync)\n"
-                "100% = fully measured Flux (maximum jitter / realism)"
+                "How much measured micro-timing leaks back into the final Flux when Hard-write is enabled.\n"
+                "0% = fully synthetic (smooth)\n"
+                "15–30% = adds measured micro cues\n"
+                "100% = fully measured Flux"
             )
-
             self.sld_flux_bleed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             self.sld_flux_bleed.setRange(0, 100)
 
-            # restore from saved opts if available
-            _saved = self._saved_opts if isinstance(getattr(self, "_saved_opts", None), dict) else {}
-            _default_bleed = float(_saved.get("flux_measured_bleed", 0.15))
+            # (C) Perceptual onset snap: Layer A+B blend
+            self.lbl_flux_onset = QtWidgets.QLabel("Perceptual onset snap: 35%")
+            self.lbl_flux_onset.setToolTip(
+                "Adds a fast-attack onset layer at every IN/OUT marker to reduce perceived lag.\n"
+                "0% = off (only smooth ADSR)\n"
+                "100% = maximum snap"
+            )
+            self.sld_flux_onset = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_onset.setRange(0, 100)
 
+            _saved = self._saved_opts if isinstance(getattr(self, "_saved_opts", None), dict) else {}
+            _default_mix   = float(_saved.get("flux_pretty_mix", PRETTY_FLUX_MIX))
+            _default_bleed = float(_saved.get("flux_measured_bleed", 0.15))
+            _default_onset = float(_saved.get("flux_onset_snap", 0.35))
+
+            self.sld_flux_mix.setValue(int(round(100.0 * max(0.0, min(1.0, _default_mix)))))
             self.sld_flux_bleed.setValue(int(round(100.0 * max(0.0, min(1.0, _default_bleed)))))
+            self.sld_flux_onset.setValue(int(round(100.0 * max(0.0, min(1.0, _default_onset)))))
+
+            row_mix = QtWidgets.QHBoxLayout()
+            row_mix.addWidget(self.lbl_flux_mix)
+            row_mix.addWidget(self.sld_flux_mix, 1)
+            opt.addLayout(row_mix)
 
             row_bleed = QtWidgets.QHBoxLayout()
             row_bleed.addWidget(self.lbl_flux_bleed)
             row_bleed.addWidget(self.sld_flux_bleed, 1)
             opt.addLayout(row_bleed)
+
+            row_onset = QtWidgets.QHBoxLayout()
+            row_onset.addWidget(self.lbl_flux_onset)
+            row_onset.addWidget(self.sld_flux_onset, 1)
+            opt.addLayout(row_onset)
+
+            def _mix_changed(v):
+                self.lbl_flux_mix.setText(f"Pretty mix: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
 
             def _bleed_changed(v):
                 self.lbl_flux_bleed.setText(f"Measured Flux bleed: {int(v)}%")
@@ -14078,8 +14224,19 @@ def run_qt(video_path):
                 except Exception:
                     pass
 
+            def _onset_changed(v):
+                self.lbl_flux_onset.setText(f"Perceptual onset snap: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
+            self.sld_flux_mix.valueChanged.connect(_mix_changed)
             self.sld_flux_bleed.valueChanged.connect(_bleed_changed)
+            self.sld_flux_onset.valueChanged.connect(_onset_changed)
+            _mix_changed(self.sld_flux_mix.value())
             _bleed_changed(self.sld_flux_bleed.value())
+            _onset_changed(self.sld_flux_onset.value())
 
 
             opt.addWidget(self.chk_apply)
@@ -14525,20 +14682,32 @@ def run_qt(video_path):
                 a = a[:self.T]
             return a
 
-        def _compute_preview_from_v(self, ri: int, vx, vy, vz) -> Dict[str, np.ndarray]:
+        def _compute_preview_from_v(
+            self,
+            ri: int,
+            vx,
+            vy,
+            vz,
+            *,
+            markers=None,
+            hard_write=False,
+            flux_pretty_mix=1.0,
+            flux_measured_bleed=0.15,
+            flux_onset_snap=0.0,
+        ) -> Dict[str, np.ndarray]:
             vx = self._fit_len(vx)
             vy = self._fit_len(vy)
             vz = self._fit_len(vz)
 
-            # "live-ish" smoothing
+            # "live-ish" smoothing (matches your preview intent)
             vx_s = robust_smooth(vx, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
             vy_s = robust_smooth(vy, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
             vz_s = robust_smooth(vz, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
 
-            speed = np.sqrt(vx_s*vx_s + vy_s*vy_s + vz_s*vz_s)
-            flux = normalize_unsigned01(speed)
-
             r = self.sc.rois[ri]
+            fps = float(self.fps)
+
+            # Axis params (same as your existing preview)
             yaw  = float(getattr(r, "io_dir_deg", getattr(r, "dir_gate_deg", 0.0)) or 0.0)
             elev = float(getattr(r, "axis_elev_deg", 0.0) or 0.0)
             kz   = float(getattr(r, "axis_z_scale", 1.0) or 1.0)
@@ -14547,12 +14716,12 @@ def run_qt(video_path):
             vx3 = vx_s
             vy3 = vy_s
             vz3 = kz * vz_s
-            vmag = np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12
 
+            vmag = np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12
             v_al = vx3*ax_u + vy3*ay_u + vz3*az_u
             axis_v = normalize_signed11(v_al)
 
-            # lateral as AoI yaw+90
+            # lateral as AoI yaw+90 (unchanged)
             lx_u, ly_u, lz_u = _axis_unit3d(yaw + 90.0, elev)
             v_lat_signed = vx3*lx_u + vy3*ly_u + vz3*lz_u
             cos_lat = np.abs(v_lat_signed / vmag)
@@ -14570,7 +14739,70 @@ def run_qt(video_path):
             v_lat_w = v_lat_signed * w_lat
             lat_amp = normalize_unsigned01(np.abs(v_lat_w))
 
-            return {"flux": flux, "axis_v": axis_v, "lat_amp": lat_amp, "vx": vx, "vy": vy, "vz": vz}
+            # ---------------- FLUX: compute like exporter ----------------
+            # Choose principal component for cycle semantics (same rule as exporter)
+            vP = vx_s if float(np.mean(np.abs(vx_s))) >= float(np.mean(np.abs(vy_s))) else vy_s
+            speed_s = np.sqrt(vx_s*vx_s + vy_s*vy_s + vz_s*vz_s)
+
+            env01_gauss = hybrid_env01(speed_s, vP, fps, mix=0.50)
+            flux_raw01 = normalize_unsigned01(speed_s)
+
+            sigma_slow = max(1.0, 0.40 * fps)
+            slow = _gauss_blur1d(speed_s, sigma_slow)
+            E_energy = normalize_signed11(speed_s - slow)
+
+            sigma_micro = max(1.0, 0.12 * fps)
+            smooth_micro = _gauss_blur1d(speed_s, sigma_micro)
+            E_micro = normalize_signed11(speed_s - smooth_micro)
+
+            E_phase = env01_gauss - float(np.mean(env01_gauss))
+
+            w_phase, w_energy, w_micro = 1.0, 0.8, 0.4
+            flux_super = (w_phase * E_phase + w_energy * E_energy + w_micro * E_micro + flux_raw01)
+
+            flux_inner = flux_norm01(flux_super, gamma=0.85, p_lo=5, p_hi=95)
+
+            # entropy lane (needed by REL50/leak)
+            sigma_ent = max(1.0, 0.35 * fps)
+            slow_ent  = _gauss_blur1d(speed_s, sigma_ent)
+            res_ent   = speed_s - slow_ent
+            entropy_roi = normalize_unsigned01(np.abs(res_ent))
+
+            # measured final (exactly like non-hard-write export)
+            flux_measured_final = flux_inner
+            if FLUX_REL50_ENABLE:
+                flux_measured_final = flux_release_to_target_by_phase01(
+                    flux_measured_final,
+                    entropy_roi,
+                    v_al,
+                    fps,
+                    io_in_sign=int(getattr(r, "io_in_sign", +1)),
+                    v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
+                    target=float(FLUX_REL50_TARGET),
+                )
+            elif FLUX_LEAK_ENABLE:
+                flux_measured_final = flux_leaky_shape01(flux_measured_final, entropy_roi, fps)
+            flux_measured_final = np.clip(flux_measured_final, 0.0, 1.0)
+
+            flux_final = flux_measured_final
+
+            # Hard-write pretty override (same as exporter now)
+            if bool(PRETTY_FLUX_ENABLE) and bool(hard_write) and markers:
+                mix = max(0.0, min(1.0, float(flux_pretty_mix)))
+                bleed = max(0.0, min(1.0, float(flux_measured_bleed)))
+                onset = max(0.0, min(1.0, float(flux_onset_snap)))
+
+                pretty = pretty_flux_adsr_with_onset_snap01(
+                    int(len(flux_raw01)), markers, fps,
+                    strength01=flux_raw01,
+                    onset_snap01=onset,
+                )
+
+                base = np.clip((1.0 - mix) * flux_measured_final + mix * pretty, 0.0, 1.0)
+                flux_final = np.clip((1.0 - bleed) * base + bleed * flux_measured_final, 0.0, 1.0)
+
+            return {"flux": flux_final, "axis_v": axis_v, "lat_amp": lat_amp, "vx": vx, "vy": vy, "vz": vz}
+
 
         def _compute_corrected_preview(self, ri: int, base: Dict[str, np.ndarray], markers):
             vx = base["vx"].copy()
@@ -14613,7 +14845,20 @@ def run_qt(video_path):
                 if self.chk_sign.isChecked():
                     vx, vy, vz = _enforce_aoi_sign_by_markers(vx, vy, vz, self.sc.rois[ri], self.fps, markers)
 
-            return self._compute_preview_from_v(ri, vx, vy, vz)
+            pretty_mix = float(self.sld_flux_mix.value()) / 100.0 if hasattr(self, "sld_flux_mix") else float(PRETTY_FLUX_MIX)
+            bleed = float(self.sld_flux_bleed.value()) / 100.0 if hasattr(self, "sld_flux_bleed") else 0.15
+            onset = float(self.sld_flux_onset.value()) / 100.0 if hasattr(self, "sld_flux_onset") else 0.0
+            hard = bool(self.chk_hard.isChecked())
+
+            return self._compute_preview_from_v(
+                ri, vx, vy, vz,
+                markers=markers,
+                hard_write=hard,
+                flux_pretty_mix=pretty_mix,
+                flux_measured_bleed=bleed,
+                flux_onset_snap=onset,
+            )
+
 
         def _update_preview(self):
             ri = self._cur_roi()
@@ -14628,12 +14873,17 @@ def run_qt(video_path):
             base = self._base_preview[ri]
             corr = self._compute_corrected_preview(ri, base, ms)
 
-            # plot: baseline + corrected if apply checked
+            # plot: baseline + corrected
             flux_curves = [base["flux"]]
             axis_curves = [base["axis_v"]]
             lat_curves  = [base["lat_amp"]]
-            if self.chk_apply.isChecked():
+
+            show_flux_corr = bool(self.chk_hard.isChecked()) or bool(self.chk_apply.isChecked())
+            show_vec_corr  = bool(self.chk_apply.isChecked())
+
+            if show_flux_corr:
                 flux_curves.append(corr["flux"])
+            if show_vec_corr:
                 axis_curves.append(corr["axis_v"])
                 lat_curves.append(corr["lat_amp"])
 
@@ -14831,8 +15081,9 @@ def run_qt(video_path):
                 "warp_positions": bool(self.chk_pos.isChecked()),
                 "enforce_aoi_sign": bool(self.chk_sign.isChecked()),
                 "hard_write_flux_aoi": bool(self.chk_hard.isChecked()),
+                "flux_pretty_mix": float(self.sld_flux_mix.value()) / 100.0,
                 "flux_measured_bleed": float(self.sld_flux_bleed.value()) / 100.0,
-
+                "flux_onset_snap": float(self.sld_flux_onset.value()) / 100.0,
             }
 
             # markers per roi
