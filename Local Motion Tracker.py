@@ -8,7 +8,7 @@ import os, sys, json, csv, math, time, re, base64, hashlib, textwrap, pickle, zl
 from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Optional, Dict, Any
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 
 import numpy as np
@@ -3471,6 +3471,22 @@ def pretty_flux_adsr_from_markers01(
     strength_gamma: float = PRETTY_FLUX_STRENGTH_GAMMA,
     post_blur_sec: float = PRETTY_FLUX_POST_BLUR_SEC,
 ):
+    """
+    ON/OFF envelope from IN/OUT markers.
+
+    What changed vs the old "per-phase ADSR":
+      - IN segments act like GATE=ON  -> Attack -> Decay -> Sustain
+      - OUT segments act like GATE=OFF -> Release
+      - Release is continuous across boundaries (no forced 0 at every marker)
+      - Peaks are always 1.0 (hand-drawn style). Use Pretty mix / Measured bleed
+        to reintroduce real dynamics.
+
+    Notes:
+      - `strength01` is intentionally NOT used to scale peak height (peak stays 1).
+        It remains in the signature for API compatibility.
+      - `mid_level` now behaves like Sustain level (0..1).
+    """
+
     import numpy as np
 
     T = int(max(0, T))
@@ -7544,8 +7560,9 @@ def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
         "roi_env",
         "roi_imp_in", "roi_imp_out",
         "roi_lowconf",
-        "roi_igE", "roi_igM",
+        "roi_igE", "roi_igdE", "roi_curv",
     ):
+        _trim_dict(getattr(sc2, nm, None))
         _trim_dict(getattr(sc2, nm, None))
 
     try:
@@ -8312,6 +8329,55 @@ def interpolate_over_dups(values, dup_flags):
 
     return out
 
+def infer_stutter_flags(vx, vy, vz,
+                        dip_ratio: float = 0.20,
+                        dir_cos: float = 0.75,
+                        neigh_pctl: float = 90.0,
+                        neigh_floor_frac: float = 0.08,
+                        dip_floor_frac: float = 0.03):
+    """
+    Conservative fallback for recorded LIVE lanes when dup_flags/lowconf were not
+    captured (older scenes / pre-patch sessions).
+
+    Marks one-frame "motion -> almost zero -> same motion" dips. Those are the
+    classic duplicate/interference artifacts that show up as direction resetting to
+    ~0 between two aligned non-trivial motion samples.
+
+    Returns a boolean mask aligned to the input arrays.
+    """
+    vx = _np.asarray(vx, _np.float64)
+    vy = _np.asarray(vy, _np.float64)
+    vz = _np.asarray(vz, _np.float64)
+    n = int(min(vx.size, vy.size, vz.size))
+    if n < 3:
+        return _np.zeros(max(0, n), bool)
+
+    vx = vx[:n]; vy = vy[:n]; vz = vz[:n]
+    sp = _np.sqrt(vx*vx + vy*vy + vz*vz)
+    if not _np.any(_np.isfinite(sp)):
+        return _np.zeros(n, bool)
+
+    ref = float(_np.percentile(sp, float(neigh_pctl))) if n else 0.0
+    neigh_floor = max(1e-6, float(neigh_floor_frac) * ref)
+    dip_floor   = max(1e-6, float(dip_floor_frac) * ref)
+
+    out = _np.zeros(n, bool)
+    for i in range(1, n - 1):
+        s0 = float(sp[i - 1]); s1 = float(sp[i]); s2 = float(sp[i + 1])
+        neigh = min(s0, s2)
+        if neigh < neigh_floor:
+            continue
+        if s1 > max(dip_floor, float(dip_ratio) * neigh):
+            continue
+
+        dot = float(vx[i - 1]*vx[i + 1] + vy[i - 1]*vy[i + 1] + vz[i - 1]*vz[i + 1])
+        denom = (s0 * s2) + 1e-9
+        if (dot / denom) < float(dir_cos):
+            continue
+
+        out[i] = True
+
+    return out
 
 def robust_smooth(x, fps, win_ms=140, ema_tc_ms=200, mad_k=3.5):
     x = _np.asarray(x, _np.float64)
@@ -9784,6 +9850,11 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                         dic[k] = list(seq[lo:hi])
             _trim(sc.roi_cx); _trim(sc.roi_cy); _trim(sc.roi_vx); _trim(sc.roi_vy); _trim(sc.roi_vz); _trim(sc.roi_env)
             _trim(sc.roi_imp_in); _trim(sc.roi_imp_out)
+            _trim(sc.roi_igE); _trim(sc.roi_igdE); _trim(sc.roi_curv); _trim(sc.roi_lowconf)
+            try:
+                sc.dup_flags = list((sc.dup_flags or [])[lo:hi])
+            except Exception:
+                pass
             T = len(sc.times)
 
     stem = os.path.splitext(os.path.basename(video_path))[0]
@@ -9952,7 +10023,15 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             low = _np.asarray(low, bool)
             flags = low if flags is None else (flags | low)
 
+        # Fallback for older live scenes that never recorded dup_flags/lowconf:
+        # detect one-frame motion dropouts and repair them the same way.
+        stutter = infer_stutter_flags(vx, vy, vz)
+        if _np.any(stutter):
+            flags = stutter if flags is None else (flags | stutter)
+
         if flags is not None:
+            cx = interpolate_over_dups(cx, flags)
+            cy = interpolate_over_dups(cy, flags)
             vx = interpolate_over_dups(vx, flags)
             vy = interpolate_over_dups(vy, flags)
             vz = interpolate_over_dups(vz, flags)
@@ -10665,6 +10744,147 @@ try:
 except Exception as _e:
     QtWidgets = None  # fallback if not installed
 
+
+class _VideoDecodeThread(QtCore.QThread):
+    """Background OpenCV decoder with coalesced requests.
+
+    Designed for *UI responsiveness*:
+      • never call VideoCapture.set()/read() on the UI thread while scrubbing/previewing.
+      • replace=True drops stale requests (scrubbing).
+      • forward_seek_limit enables fast forward "skip" without random seeks (good for slider drags).
+    """
+    frameReady = QtCore.Signal(int, object, object)  # (frame_idx, bgr_frame_or_None, gray_or_None)
+
+    def __init__(
+        self,
+        video_path: str,
+        *,
+        out_w: int,
+        out_h: int,
+        want_gray: bool = False,
+        parent=None,
+        name: str = "",
+        forward_seek_limit: int = 240,
+    ):
+        super().__init__(parent)
+        self.video_path = str(video_path)
+        self.out_w = int(max(1, out_w))
+        self.out_h = int(max(1, out_h))
+        self.want_gray = bool(want_gray)
+        self.name = str(name or "decoder")
+        self.forward_seek_limit = int(max(0, forward_seek_limit))
+
+        self._stop = False
+        self._dec_pos = -1
+
+        self._queue = deque()
+        self._queued = set()
+        self._cond = threading.Condition()
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+    def request(self, idx: int, *, replace: bool = True, priority: bool = False):
+        try:
+            idx = int(idx)
+        except Exception:
+            return
+
+        with self._cond:
+            if replace:
+                self._queue.clear()
+                self._queued.clear()
+
+            if idx in self._queued:
+                if priority:
+                    try:
+                        self._queue.remove(idx)
+                        self._queue.appendleft(idx)
+                    except Exception:
+                        pass
+                self._cond.notify_all()
+                return
+
+            if priority:
+                self._queue.appendleft(idx)
+            else:
+                self._queue.append(idx)
+            self._queued.add(idx)
+            self._cond.notify_all()
+
+    def _read_frame(self, cap: cv.VideoCapture, target_idx: int):
+        # Sequential read (fast path)
+        if self._dec_pos >= 0:
+            if target_idx == self._dec_pos + 1:
+                ok, fr = cap.read()
+                if ok:
+                    self._dec_pos = target_idx
+                return ok, fr
+
+            # Fast forward skip without random seek (keeps decoder state hot).
+            if target_idx > self._dec_pos and self.forward_seek_limit > 0:
+                gap = int(target_idx - self._dec_pos)
+                if 2 <= gap <= self.forward_seek_limit:
+                    ok = True
+                    # grab gap-1 frames quickly
+                    for _ in range(gap - 1):
+                        ok = cap.grab()
+                        if not ok:
+                            break
+                        self._dec_pos += 1
+                    if ok:
+                        ok, fr = cap.read()
+                        if ok:
+                            self._dec_pos = target_idx
+                        return ok, fr
+
+        # Random seek fallback (slow but correct)
+        cap.set(cv.CAP_PROP_POS_FRAMES, int(target_idx))
+        ok, fr = cap.read()
+        if ok:
+            self._dec_pos = int(target_idx)
+        return ok, fr
+
+    def run(self):
+        cap = cv.VideoCapture(self.video_path)
+        if cap is None or not cap.isOpened():
+            self.frameReady.emit(-1, None, None)
+            return
+
+        try:
+            while True:
+                with self._cond:
+                    while (not self._stop) and (not self._queue):
+                        self._cond.wait(timeout=0.25)
+                    if self._stop:
+                        break
+                    idx = int(self._queue.popleft())
+                    self._queued.discard(idx)
+
+                ok, fr = self._read_frame(cap, max(0, idx))
+                if (not ok) or (fr is None):
+                    self.frameReady.emit(int(idx), None, None)
+                    continue
+
+                # Resize once, in the background.
+                if fr.shape[1] != self.out_w or fr.shape[0] != self.out_h:
+                    fr = cv.resize(fr, (self.out_w, self.out_h), interpolation=cv.INTER_AREA)
+
+                gray = None
+                if self.want_gray:
+                    gray = cv.cvtColor(fr, cv.COLOR_BGR2GRAY)
+
+                self.frameReady.emit(int(idx), fr, gray)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+
+
 class _WheelIOFilter(QtCore.QObject):
     def __init__(self, get_active_scene, get_rois_at):
         super().__init__()
@@ -10916,6 +11136,31 @@ def run_qt(video_path):
 
             
             self._dec_pos = -1  # last decoded frame index from self.cap
+
+            # --- Ultra-low-latency scrub preview (background decode) -----------------
+            # Scrubbing is random-access hell for most codecs. Two tactics:
+            #   (1) decode *small* frames in a background thread (no UI stalls)
+            #   (2) quantize targets while scrubbing fast (decode fewer unique indices)
+            self._scrub_last_seek_t = 0.0
+            self._scrub_last_seek_idx = int(self.frame_idx)
+            self._scrub_quant_step = 1
+
+            sw = int(min(320, max(120, self.W // 6)))  # aggressive downscale (latency > beauty)
+            sh = int(max(1, round(sw * self.H / max(1, self.W))))
+            self._scrub_w = sw
+            self._scrub_h = sh
+
+            self._scrub_frame = None
+            self._scrub_idx = -1
+            self._scrub_last_request = -1
+
+            self._scrub_cache = OrderedDict()  # frame_idx -> small BGR
+            self._scrub_cache_max = 180
+
+            self._bg_scrub = _VideoDecodeThread(video_path, out_w=sw, out_h=sh, want_gray=False, parent=self, name="scrub", forward_seek_limit=int(max(120, self.fps*2)))
+            self._bg_scrub.frameReady.connect(self._on_bg_scrub_ready)
+            self._bg_scrub.start()
+            # ------------------------------------------------------------------------
 
             # view mapping
             self.view_scale = 1.0; self.view_offset=(0,0)
@@ -11745,7 +11990,20 @@ def run_qt(video_path):
             self._dec_pos = -1
             self.prev_gray = None
 
-            self.fast_scrub_until = time.time() + 0.12  # lighter HUD while scrubbing
+            self.fast_scrub_until = time.time() + 0.25  # scrub window (keeps UI in fast mode)
+
+            # Kick the scrub decoder immediately (quantized index).
+            try:
+                q_idx = self._scrub_quantize_idx(idx)
+                self._request_scrub_frame(q_idx)
+            except Exception:
+                pass
+
+            try:
+                if getattr(self, "view", None) is not None:
+                    self.view.update()
+            except Exception:
+                pass
 
         def _read_preview_at(self, idx: int):
             idx = int(np.clip(idx, 0, self.N-1))
@@ -11763,6 +12021,151 @@ def run_qt(video_path):
             return fr
 
 
+
+        # ---------------- scrub preview helpers (background) ----------------
+        def _scrub_cache_put(self, fi: int, frame: np.ndarray):
+            try:
+                fi = int(fi)
+            except Exception:
+                return
+            if frame is None:
+                return
+            try:
+                self._scrub_cache[fi] = frame
+                self._scrub_cache.move_to_end(fi)
+                mx = int(getattr(self, "_scrub_cache_max", 180))
+                while mx > 0 and len(self._scrub_cache) > mx:
+                    self._scrub_cache.popitem(last=False)
+            except Exception:
+                pass
+
+        def _scrub_cache_get(self, fi: int):
+            try:
+                fi = int(fi)
+            except Exception:
+                return None
+            try:
+                fr = self._scrub_cache.get(fi, None)
+                if fr is not None:
+                    self._scrub_cache.move_to_end(fi)
+                return fr
+            except Exception:
+                return None
+
+        def _scrub_cache_get_nearest(self, fi: int):
+            try:
+                fi = int(fi)
+            except Exception:
+                return None
+            try:
+                if not self._scrub_cache:
+                    return None
+                # Cache is small (<= ~200), linear scan is fine.
+                best_k = None
+                best_d = 1 << 60
+                for k in self._scrub_cache.keys():
+                    d = abs(int(k) - fi)
+                    if d < best_d:
+                        best_d = d
+                        best_k = int(k)
+                        if best_d == 0:
+                            break
+                if best_k is None:
+                    return None
+                fr = self._scrub_cache.get(best_k, None)
+                if fr is not None:
+                    self._scrub_cache.move_to_end(best_k)
+                return fr
+            except Exception:
+                return None
+
+        def _update_scrub_quant_step(self, idx: int):
+            now = time.time()
+            last_t = float(getattr(self, "_scrub_last_seek_t", 0.0) or 0.0)
+            last_i = int(getattr(self, "_scrub_last_seek_idx", idx) or idx)
+
+            if last_t > 0.0 and idx != last_i:
+                dt = max(1e-3, float(now - last_t))
+                di = abs(int(idx) - int(last_i))
+                speed = float(di) / dt  # frames / second
+
+                # Aggressive quantization while scrubbing fast.
+                # Goal: reduce random seeks, keep frame updates "snappy".
+                step = 1
+                if speed >= 20000:
+                    step = int(self.fps * 2.0)
+                elif speed >= 10000:
+                    step = int(self.fps * 1.0)
+                elif speed >= 5000:
+                    step = int(self.fps * 0.5)
+                elif speed >= 2000:
+                    step = 24
+                elif speed >= 800:
+                    step = 12
+                elif speed >= 300:
+                    step = 6
+                elif speed >= 120:
+                    step = 3
+                else:
+                    step = 1
+
+                step = int(max(1, step))
+                step = int(min(step, max(1, int(self.fps * 4.0))))
+                self._scrub_quant_step = step
+
+            self._scrub_last_seek_t = float(now)
+            self._scrub_last_seek_idx = int(idx)
+
+        def _scrub_quantize_idx(self, idx: int) -> int:
+            idx = int(np.clip(int(idx), 0, max(0, self.N - 1)))
+            try:
+                self._update_scrub_quant_step(idx)
+            except Exception:
+                pass
+            step = int(max(1, int(getattr(self, "_scrub_quant_step", 1) or 1)))
+            if step <= 1:
+                return idx
+            q = int(round(idx / float(step)) * step)
+            return int(np.clip(q, 0, max(0, self.N - 1)))
+
+        def _request_scrub_frame(self, idx: int):
+            idx = int(np.clip(int(idx), 0, max(0, self.N - 1)))
+
+            # If we already have it cached, don't spam the decoder.
+            if self._scrub_cache_get(idx) is not None:
+                return
+
+            if int(getattr(self, "_scrub_last_request", -1)) == idx:
+                return
+            self._scrub_last_request = int(idx)
+
+            try:
+                if getattr(self, "_bg_scrub", None) is not None:
+                    self._bg_scrub.request(int(idx), replace=True, priority=True)
+            except Exception:
+                pass
+
+        @QtCore.Slot(int, object, object)
+        def _on_bg_scrub_ready(self, frame_idx, frame, _gray_unused):
+            try:
+                fi = int(frame_idx)
+            except Exception:
+                return
+            if frame is None:
+                return
+
+            self._scrub_frame = frame
+            self._scrub_idx = fi
+            self._scrub_cache_put(fi, frame)
+
+            # Repaint ASAP while scrubbing.
+            try:
+                if (not self.playing) and (time.time() < float(getattr(self, "fast_scrub_until", 0.0))):
+                    if getattr(self, "view", None) is not None:
+                        self.view.update()
+            except Exception:
+                pass
+        # -------------------------------------------------------------------
         def draw_timeline(self, img):
             H_, W_ = img.shape[:2]
             y0 = H_ - self.TIMELINE_H
@@ -12663,7 +13066,7 @@ def run_qt(video_path):
             if mode_txt and self.naming_roi < 0:
                 draw_text(hud, mode_txt, 68, (255,230,180), base_scale)
 
-            scrubbing_now = (time.time() < self.fast_scrub_until)
+            scrubbing_now = (not self.playing) and (not getattr(self, "recording", False)) and (time.time() < float(getattr(self, "fast_scrub_until", 0.0)))
             if not scrubbing_now and self.active_scene >= 0:
                 sc = self.scenes[self.active_scene]
                 for ri, r in enumerate(sc.rois):
@@ -12760,39 +13163,70 @@ def run_qt(video_path):
             if self.active_scene < 0:
                 self.adding=False; self.repicking=False; self.naming_roi=-1
 
-            # decide if we actually need to decode a new frame
-            need_new = (
-                self._cached_frame is None or
-                self.playing or
-                self._seeking or
-                self._cached_idx != self.frame_idx
-            )
+                        # Ultra-low-latency scrubbing: never decode/seek in UI thread while the user is actively scrubbing.
+            scrubbing_now = (not self.playing) and (not getattr(self, "recording", False)) and (time.time() < float(getattr(self, "fast_scrub_until", 0.0)))
 
-            if need_new:
-                ok, frame = self._read_frame(self.frame_idx)
-                if not ok:
-                    # EOF/decoder hiccup: hold last frame cleanly
-                    self.playing = False
-                    self.frame_idx = min(self.N-1, max(0, self.frame_idx))
-                    ok2, frame = self._read_frame(self.frame_idx)
-                    if not ok2:
-                        frame = np.zeros((self.H, self.W, 3), np.uint8)
+            if scrubbing_now:
+                # Quantize target to reduce random-seek churn while scrubbing fast.
+                q_idx = self._scrub_quantize_idx(int(self.frame_idx))
+                self._request_scrub_frame(q_idx)
 
-                if PROC_SCALE != 1.0:
-                    frame = cv.resize(frame, (self.W, self.H), interpolation=cv.INTER_AREA)
-                gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+                # Best-effort scrub frame (exact -> nearest -> latest).
+                sf = self._scrub_cache_get(q_idx)
+                if sf is None:
+                    sf = self._scrub_cache_get_nearest(q_idx)
+                if sf is None:
+                    sf = getattr(self, "_scrub_frame", None)
 
-                # update cache and clear one-shot seek
-                self._prev_cached_frame = self._cached_frame
-                self._cached_frame = frame
-                self._cached_gray  = gray
-                self._cached_idx   = self.frame_idx
-                self._seeking      = False
+                if sf is not None:
+                    # Display upscaled scrub frame for consistent UI mapping.
+                    try:
+                        frame = cv.resize(sf, (self.W, self.H), interpolation=cv.INTER_NEAREST)
+                    except Exception:
+                        frame = sf
+                elif self._cached_frame is not None:
+                    frame = self._cached_frame
+                else:
+                    frame = np.zeros((self.H, self.W, 3), np.uint8)
+
+                # Gray isn't used during scrubbing (no tracking), but keep something valid.
+                gray = self._cached_gray if self._cached_gray is not None else cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
             else:
-                frame = self._cached_frame
-                gray  = self._cached_gray
+    # decide if we actually need to decode a new frame
+                need_new = (
+                    self._cached_frame is None or
+                    self.playing or
+                    self._seeking or
+                    self._cached_idx != self.frame_idx
+                )
 
-            # --- Live structural preview update (ROI-only) ---
+                if need_new:
+                    ok, frame = self._read_frame(self.frame_idx)
+                    if not ok:
+                        # EOF/decoder hiccup: hold last frame cleanly
+                        self.playing = False
+                        self.frame_idx = min(self.N-1, max(0, self.frame_idx))
+                        ok2, frame = self._read_frame(self.frame_idx)
+                        if not ok2:
+                            frame = np.zeros((self.H, self.W, 3), np.uint8)
+
+                    if PROC_SCALE != 1.0:
+                        frame = cv.resize(frame, (self.W, self.H), interpolation=cv.INTER_AREA)
+                    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
+                    # update cache and clear one-shot seek
+                    self._prev_cached_frame = self._cached_frame
+                    self._cached_frame = frame
+                    self._cached_gray  = gray
+                    self._cached_idx   = self.frame_idx
+                    self._seeking      = False
+                else:
+                    frame = self._cached_frame
+                    gray  = self._cached_gray
+
+            
+# --- Live structural preview update (ROI-only) ---
             if getattr(self, "struct_preview", False) and self.active_scene >= 0:
                 try:
                     sc = self.scenes[self.active_scene]
@@ -12827,33 +13261,75 @@ def run_qt(video_path):
 
             changed = (self.frame_idx != self.last_sampled)
             if self.prev_gray is not None and self.active_scene >= 0 and self.playing and changed:
-                self.tracker.prepare_scaled_frames(self.prev_gray, gray)
-                # OPTIONAL: prefetch global camera motion once per frame
-                try:
-                    sc = self.scenes[self.active_scene]
-                    self.tracker._cmat_scene_rois = list(sc.rois)
-                    need_global = any(
-                        str(getattr(r, "cmat_mode", "off")).lower() == "global"
-                        for r in sc.rois
-                    )
-                    if need_global and hasattr(self.tracker, "prefetch_global_drift"):
-                        self.tracker.prefetch_global_drift(self.prev_gray, gray)
-                except Exception:
-                    pass
-                for ri, r in enumerate(self.scenes[self.active_scene].rois):
-                    self.scenes[self.active_scene].rois[ri] = self.tracker.update_roi(r, self.prev_gray, gray)
-                sc = self.scenes[self.active_scene]; t = self.frame_idx / self.fps
+                sc = self.scenes[self.active_scene]
+                t = self.frame_idx / self.fps
                 if sc.times and t <= sc.times[-1] + (0.25 / self.fps):
                     self._truncate_scene_to_time(sc, t)
 
-                sc.times.append(t); self.last_sampled = self.frame_idx
+                is_dup = bool(is_near_duplicate_frame(self.prev_gray, gray))
+
+                if not is_dup:
+                    self.tracker.prepare_scaled_frames(self.prev_gray, gray)
+                    # OPTIONAL: prefetch global camera motion once per frame
+                    try:
+                        self.tracker._cmat_scene_rois = list(sc.rois)
+                        need_global = any(
+                            str(getattr(r, "cmat_mode", "off")).lower() == "global"
+                            for r in sc.rois
+                        )
+                        if need_global and hasattr(self.tracker, "prefetch_global_drift"):
+                            self.tracker.prefetch_global_drift(self.prev_gray, gray)
+                    except Exception:
+                        pass
+                    for ri, r in enumerate(sc.rois):
+                        sc.rois[ri] = self.tracker.update_roi(r, self.prev_gray, gray)
+
+                sc.times.append(t)
+                sc.dup_flags.append(bool(is_dup))
+                self.last_sampled = self.frame_idx
+
                 for ri, r in enumerate(sc.rois):
-                    cx, cy = sc.rois[ri].last_center; vx, vy, vz = sc.rois[ri].vx_ps, sc.rois[ri].vy_ps, sc.rois[ri].vz_rel_s
+                    rr = sc.rois[ri]
+                    cx, cy = rr.last_center
+                    if not np.isfinite(cx) or not np.isfinite(cy) or (cx == 0.0 and cy == 0.0):
+                        rx, ry, rw, rh = map(float, rr.rect)
+                        cx = rx + rw / 2.0
+                        cy = ry + rh / 2.0
+                    vx, vy, vz = rr.vx_ps, rr.vy_ps, rr.vz_rel_s
+
                     sc.roi_cx.setdefault(ri, []).append(float(cx))
                     sc.roi_cy.setdefault(ri, []).append(float(cy))
                     sc.roi_vx.setdefault(ri, []).append(float(vx))
                     sc.roi_vy.setdefault(ri, []).append(float(vy))
                     sc.roi_vz.setdefault(ri, []).append(float(vz))
+
+                    if is_dup:
+                        curv_list = sc.roi_curv.setdefault(ri, [])
+                        last_curv = curv_list[-1] if curv_list else 0.0
+                        curv_list.append(float(last_curv))
+
+                        igE_list  = sc.roi_igE.setdefault(ri, [])
+                        igdE_list = sc.roi_igdE.setdefault(ri, [])
+                        igE_list.append(float(igE_list[-1] if igE_list else 0.0))
+                        igdE_list.append(float(igdE_list[-1] if igdE_list else 0.0))
+
+                        rr._frame_lowconf = False
+                        sc.roi_lowconf.setdefault(ri, []).append(False)
+                    else:
+                        rect = rr.rect
+                        cval = compute_roi_curvature(self.prev_gray, gray, rect)
+                        sc.roi_curv.setdefault(ri, []).append(float(cval))
+
+                        igE = compute_roi_iglog_energy(gray, rect)
+                        prevE = float(getattr(rr, "_iglog_E_prev", 0.0))
+                        dE = float(igE - prevE)
+                        rr._iglog_E_prev = float(igE)
+                        sc.roi_igE.setdefault(ri, []).append(float(igE))
+                        sc.roi_igdE.setdefault(ri, []).append(float(dE))
+
+                        lc = bool(getattr(rr, "_frame_lowconf", False))
+                        sc.roi_lowconf.setdefault(ri, []).append(lc)
+
                     env = math.sqrt(vx*vx + vy*vy + vz*vz)
                     dt = 1.0/max(1e-6, float(self.fps))
                     vx_arr = sc.roi_vx[ri]; vy_arr = sc.roi_vy[ri]; vz_arr = sc.roi_vz[ri]
@@ -12866,9 +13342,9 @@ def run_qt(video_path):
                     jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
                     # live numbers (magnitudes at tail)
-                    r.last_speed = float(np.sqrt(vx_s[-1]**2 + vy_s[-1]**2 + vz_s[-1]**2))
-                    r.last_acc   = float(np.sqrt(ax_s[-1]**2 + ay_s[-1]**2 + az_s[-1]**2))
-                    r.last_jerk  = float(np.sqrt(jx_s[-1]**2 + jy_s[-1]**2 + jz_s[-1]**2))
+                    rr.last_speed = float(np.sqrt(vx_s[-1]**2 + vy_s[-1]**2 + vz_s[-1]**2))
+                    rr.last_acc   = float(np.sqrt(ax_s[-1]**2 + ay_s[-1]**2 + az_s[-1]**2))
+                    rr.last_jerk  = float(np.sqrt(jx_s[-1]**2 + jy_s[-1]**2 + jz_s[-1]**2))
 
                     if len(vxw) < Wn or len(vyw) < Wn or len(vzw) < max(5, Wn//2):
                         # not enough samples → skip live impact this frame
@@ -12877,22 +13353,27 @@ def run_qt(video_path):
                         # existing impact_score_cycles(...) path
                         ...
 
-
                     # hysteresis impacts: pick near tail (not just last 2 samples)
-                    S_any, in_idx, out_idx = _impacts_for_mode(r, vx_s, vy_s, vz_s, self.fps)
-                    tail_allow = max(
-                        2,
-                        int(round(0.08 * self.fps)) + int(round(getattr(r, "impact_lead_ms", 40) * self.fps / 1000.0))
-                    )
                     fired_dir = 0
-                    if out_idx.size and out_idx[-1] >= len(S_any) - tail_allow:
-                        fired_dir = +1
-                    elif in_idx.size and in_idx[-1] >= len(S_any) - tail_allow:
-                        fired_dir = -1
+                    if not is_dup:
+                        S_any, in_idx, out_idx = _impacts_for_mode(rr, vx_s, vy_s, vz_s, self.fps)
+                        tail_allow = max(
+                            2,
+                            int(round(0.08 * self.fps)) + int(round(getattr(rr, "impact_lead_ms", 40) * self.fps / 1000.0))
+                        )
+                        if out_idx.size and out_idx[-1] >= len(S_any) - tail_allow:
+                            fired_dir = +1
+                        elif in_idx.size and in_idx[-1] >= len(S_any) - tail_allow:
+                            fired_dir = -1
+
+                        refr_gap = max(1, int(round(float(getattr(rr, "refractory_ms", 140)) * self.fps / 1000.0)))
+                        if fired_dir and (int(self.frame_idx) - int(getattr(rr, "_last_impact_idx", -10**9))) < refr_gap:
+                            fired_dir = 0
+
                     if fired_dir:
-                        r._impact_dir = fired_dir
-                        _impact_trigger(r, r._impact_dir, now=time.time())
-                        r._last_impact_idx = self.frame_idx
+                        rr._impact_dir = fired_dir
+                        _impact_trigger(rr, rr._impact_dir, now=time.time())
+                        rr._last_impact_idx = self.frame_idx
                     # record a lane value EVERY frame so lengths match sc.times
                     sc.roi_imp_in.setdefault(ri, [])
                     sc.roi_imp_out.setdefault(ri, [])
@@ -12900,7 +13381,7 @@ def run_qt(video_path):
                     sc.roi_imp_out[ri].append(1.0 if fired_dir == +1 else 0.0)  # OUT
 
                     # commit updated ROI
-                    self.scenes[self.active_scene].rois[ri] = r
+                    self.scenes[self.active_scene].rois[ri] = rr
 
                     sc.roi_env.setdefault(ri, []).append(float(env))
 
@@ -13689,6 +14170,14 @@ def run_qt(video_path):
                 if self.ff is not None: _ff_close(self.ff); self.ff=None
                 if self.ocv_writer is not None: self.ocv_writer.release(); self.ocv_writer=None
                 if self.writer is not None: self.writer.release()
+                # Stop background scrub decoder cleanly (avoid QThread warnings on exit).
+                try:
+                    if getattr(self, "_bg_scrub", None) is not None:
+                        self._bg_scrub.stop()
+                        self._bg_scrub.wait(1500)
+                except Exception:
+                    pass
+
                 self.cap.release(); self.thumb_cap.release()
                 QtWidgets.QApplication.quit(); return
             if k in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
@@ -13973,7 +14462,7 @@ def run_qt(video_path):
             self.H = int(H)
             # ---- FAST export preview tuning ----
             # Lower max width = faster scrubbing (480 = extremely snappy, 640 = good balance)
-            self._pv_max_w = 640
+            self._pv_max_w = 320
             self._pv_cache_max = 180       # frames cached (180 * ~640x360x3 ~= ~140MB worst-case)
             self._pv_live_drag = True      # False = fastest (only updates on slider release)
 
@@ -14015,11 +14504,17 @@ def run_qt(video_path):
             self._push = False
             self._accepted = False
 
-            self._cap = None
-            try:
-                self._cap = cv.VideoCapture(self.video_path)
-            except Exception:
-                self._cap = None
+            # Background decoder: keeps the preview dialog responsive while scrubbing.
+            # (We do NOT decode inside the UI thread.)
+            self._cap = None  # legacy (unused)
+            self._pv_dec = _VideoDecodeThread(self.video_path, out_w=self._pvW, out_h=self._pvH, want_gray=False, parent=self, name="export_preview", forward_seek_limit=int(max(120, self.fps*2)))
+            self._pv_dec.frameReady.connect(self._on_pv_frame_ready)
+            self._pv_dec.start()
+            self._pv_requested_frame_idx = -1
+            self._pv_requested_sample_idx = -1
+            self._pv_dragging = False
+            self._pv_quant_step = max(1, int(round(self.fps * 0.10)))  # ~100ms quant while dragging
+            self._pv_last_vis = None
 
             self.T = int(len(getattr(self.sc, "times", []) or []))
             self._markers_by_roi: Dict[int, List[Dict[str, Any]]] = {}
@@ -14082,7 +14577,9 @@ def run_qt(video_path):
             self.sld.setMaximum(max(0, self.T - 1))
             self.sld.setValue(0)
             self.sld.setTracking(bool(self._pv_live_drag))
-            self.sld.sliderReleased.connect(lambda: self._request_frame_preview(self.sld.value(), immediate=True))
+            self.sld.sliderPressed.connect(self._on_slider_pressed)
+            self.sld.sliderReleased.connect(self._on_slider_released)
+            self.sld.valueChanged.connect(lambda v: self._request_frame_preview(int(v), immediate=False))
 
             scrub.addWidget(self.sld, 1)
             self.lbl_t = QtWidgets.QLabel("t=0.000s  idx=0")
@@ -14698,6 +15195,23 @@ def run_qt(video_path):
             vx = self._fit_len(vx)
             vy = self._fit_len(vy)
             vz = self._fit_len(vz)
+            flags = None
+            if getattr(self.sc, "dup_flags", None) and len(self.sc.dup_flags) == self.T:
+                flags = np.asarray(self.sc.dup_flags, bool)
+
+            low = getattr(self.sc, "roi_lowconf", {}).get(int(ri), [])
+            if low and len(low) == self.T:
+                low = np.asarray(low, bool)
+                flags = low if flags is None else (flags | low)
+
+            stutter = infer_stutter_flags(vx, vy, vz)
+            if np.any(stutter):
+                flags = stutter if flags is None else (flags | stutter)
+
+            if flags is not None:
+                vx = interpolate_over_dups(vx, flags)
+                vy = interpolate_over_dups(vy, flags)
+                vz = interpolate_over_dups(vz, flags)
 
             # "live-ish" smoothing (matches your preview intent)
             vx_s = robust_smooth(vx, self.fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
@@ -14973,36 +15487,69 @@ def run_qt(video_path):
             if self._pv_pending_sample_idx is None and self._pv_timer.isActive():
                 self._pv_timer.stop()
 
-        # ---------------- frame preview ----------------
-        def _update_frame_preview(self, sample_idx: int):
-            if self._cap is None or self.T <= 0:
-                self.lbl_frame.setText("(no video)")
+                # ---------------- frame preview ----------------
+
+        @QtCore.Slot(int, object, object)
+        def _on_pv_frame_ready(self, frame_idx, frame, _gray_unused):
+            """Receive decoded preview frame (BGR, already resized) on UI thread."""
+            try:
+                fi = int(frame_idx)
+            except Exception:
+                return
+            if frame is None:
+                return
+
+            # Cache it.
+            try:
+                self._pv_cache_put(fi, frame)
+            except Exception:
+                pass
+
+            # If this is the frame we're waiting for, render immediately.
+            try:
+                if fi == int(getattr(self, "_pv_requested_frame_idx", -1)):
+                    si = int(getattr(self, "_pv_requested_sample_idx", -1))
+                    if si >= 0:
+                        base = self._pv_cache_get(fi)
+                        if base is not None:
+                            self._render_preview_from_base(base, si)
+            except Exception:
+                pass
+
+        def _pv_cache_get_nearest(self, frame_idx: int):
+            """Nearest cached base frame (used to avoid 'blank' while decoding)."""
+            try:
+                frame_idx = int(frame_idx)
+            except Exception:
+                return None
+            try:
+                if not self._pv_cache:
+                    return None
+                best_k = None
+                best_d = 1 << 60
+                for k in self._pv_cache.keys():
+                    d = abs(int(k) - frame_idx)
+                    if d < best_d:
+                        best_d = d
+                        best_k = int(k)
+                        if best_d == 0:
+                            break
+                if best_k is None:
+                    return None
+                base = self._pv_cache.get(best_k, None)
+                if base is not None:
+                    self._pv_cache.move_to_end(best_k)
+                return base
+            except Exception:
+                return None
+
+        def _render_preview_from_base(self, base: np.ndarray, sample_idx: int):
+            """Overlay ROI gizmos on top of a decoded preview frame and blit into Qt."""
+            if base is None:
+                self.lbl_frame.setText("(no frame)")
                 return
 
             sample_idx = int(np.clip(int(sample_idx), 0, max(0, self.T - 1)))
-            try:
-                t = float(self.sc.times[sample_idx])
-            except Exception:
-                t = 0.0
-            frame_idx = int(round(t * self.fps))
-
-            # ---- base frame from cache or decode ----
-            base = self._pv_cache_get(frame_idx)
-            if base is None:
-                ok, fr = self._pv_read_frame(max(0, frame_idx))
-                if not ok or fr is None:
-                    self.lbl_frame.setText("(frame read failed)")
-                    return
-
-                # ONE resize total: decode -> preview size (skip resize-to-processing-scale)
-                if getattr(self, "_pv_scale", 1.0) != 1.0:
-                    try:
-                        fr = cv.resize(fr, (self._pvW, self._pvH), interpolation=cv.INTER_AREA)
-                    except Exception:
-                        pass
-
-                base = fr
-                self._pv_cache_put(frame_idx, base)
 
             # draw overlay on a copy (keep cache clean)
             try:
@@ -15041,25 +15588,89 @@ def run_qt(video_path):
             except Exception:
                 pass
 
-            # ---- Qt render (BGR direct if available; else fallback to RGB) ----
+            # ---- Qt render (NO deep-copy; keep buffer alive in self._pv_last_vis) ----
             try:
+                self._pv_last_vis = vis  # keep backing memory alive until next update
                 h, w = vis.shape[:2]
                 bpl = int(vis.strides[0])
 
                 if getattr(self, "_qt_fmt_bgr", None) is not None:
-                    qimg = QtGui.QImage(vis.data, w, h, bpl, self._qt_fmt_bgr).copy()
+                    qimg = QtGui.QImage(vis.data, w, h, bpl, self._qt_fmt_bgr)
                 else:
                     rgb = cv.cvtColor(vis, cv.COLOR_BGR2RGB)
+                    self._pv_last_vis = rgb
                     h, w = rgb.shape[:2]
                     bpl = int(rgb.strides[0])
-                    qimg = QtGui.QImage(rgb.data, w, h, bpl, self._qt_fmt_rgb).copy()
+                    qimg = QtGui.QImage(rgb.data, w, h, bpl, self._qt_fmt_rgb)
 
-                # No scaling here; label is fixed-size to match preview dims
                 self.lbl_frame.setPixmap(QtGui.QPixmap.fromImage(qimg))
             except Exception:
                 self.lbl_frame.setText("(render failed)")
 
-        # ---------------- export ----------------
+        def _on_slider_pressed(self):
+            self._pv_dragging = True
+
+        def _on_slider_released(self):
+            self._pv_dragging = False
+            # On release: request the *exact* frame ASAP.
+            try:
+                self._request_frame_preview(int(self.sld.value()), immediate=True)
+            except Exception:
+                pass
+
+        def _update_frame_preview(self, sample_idx: int):
+            if self.T <= 0:
+                self.lbl_frame.setText("(no samples)")
+                return
+
+            sample_idx = int(np.clip(int(sample_idx), 0, max(0, self.T - 1)))
+            try:
+                t = float(self.sc.times[sample_idx])
+            except Exception:
+                t = 0.0
+            frame_idx = int(round(t * self.fps))
+
+            # Quantize decode target while dragging (reduces random seek churn).
+            decode_idx = int(frame_idx)
+            try:
+                if bool(getattr(self, "_pv_dragging", False)):
+                    step = int(max(1, int(getattr(self, "_pv_quant_step", 1) or 1)))
+                    if step > 1:
+                        decode_idx = int(round(frame_idx / float(step)) * step)
+            except Exception:
+                decode_idx = int(frame_idx)
+
+            # ---- base frame from cache or nearest cached (instant feedback) ----
+            base = self._pv_cache_get(frame_idx)
+            if base is None and decode_idx != frame_idx:
+                base = self._pv_cache_get(decode_idx)
+            if base is None:
+                base = self._pv_cache_get_nearest(frame_idx)
+
+            if base is not None:
+                self._render_preview_from_base(base, sample_idx)
+            else:
+                self.lbl_frame.setText("(decoding…)" )
+
+            # ---- schedule decode in background (coalesced) ----
+            try:
+                self._pv_requested_frame_idx = int(decode_idx)
+                self._pv_requested_sample_idx = int(sample_idx)
+            except Exception:
+                pass
+
+            try:
+                if getattr(self, "_pv_dec", None) is not None:
+                    self._pv_dec.request(int(decode_idx), replace=True, priority=True)
+
+                    # Small prefetch window (helps continuous dragging).
+                    step = int(max(1, int(getattr(self, "_pv_quant_step", 1) or 1))) if bool(getattr(self, "_pv_dragging", False)) else 1
+                    for off in (1, 2, 3, 4):
+                        self._pv_dec.request(int(decode_idx + off*step), replace=False, priority=False)
+            except Exception:
+                pass
+
+# ---------------- export ----------------
         def _accept_export_csv(self):
             self._push = False
             self._accepted = True
@@ -15155,6 +15766,12 @@ def run_qt(video_path):
             try:
                 if self._cap is not None:
                     self._cap.release()
+                try:
+                    if getattr(self, "_pv_dec", None) is not None:
+                        self._pv_dec.stop()
+                        self._pv_dec.wait(1500)
+                except Exception:
+                    pass
             except Exception:
                 pass
             super().closeEvent(ev)
@@ -15260,7 +15877,7 @@ def run_qt(video_path):
             if not hasattr(self.ctrl, "hud"): return
             hud = self.ctrl.hud
             h, w = hud.shape[:2]
-            qimg = QtGui.QImage(hud.data, w, h, w*3, QtGui.QImage.Format.Format_BGR888).copy()
+            qimg = QtGui.QImage(hud.data, w, h, int(hud.strides[0]), QtGui.QImage.Format.Format_BGR888)
             # letterbox fit
             W, H = self.width(), self.height()
             scale = min(max(W/ self.ctrl.W, 0.001), max(H/ self.ctrl.H, 0.001))
@@ -15327,6 +15944,16 @@ def run_qt(video_path):
         def toggle_fullscreen(self):
             if self.isFullScreen(): self.showNormal()
             else: self.showFullScreen()
+
+        def closeEvent(self, ev):
+            # Clean shutdown for background decoders (prevents QThread warnings).
+            try:
+                if getattr(self.ctrl, "_bg_scrub", None) is not None:
+                    self.ctrl._bg_scrub.stop()
+                    self.ctrl._bg_scrub.wait(1500)
+            except Exception:
+                pass
+            super().closeEvent(ev)
 
     ctrl = Controller(ai_cfg)
     mw = MainWindow(ctrl)     # MainWindow creates the ONE visible VideoView
