@@ -8,6 +8,7 @@ import os, sys, json, csv, math, time, re, base64, hashlib, textwrap, pickle, zl
 from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Optional, Dict, Any
 import threading
+import random
 from collections import OrderedDict, deque
 
 
@@ -3195,46 +3196,129 @@ def roi_replace(r, **updates):
     return replace(r, **updates)
 
 
+def _mul_bgr(col, k: float):
+    return tuple(int(np.clip(round(float(c) * float(k)), 0, 255)) for c in col)
+
+
+def _poly_scale_about(pts: np.ndarray, center_xy, scale: float) -> np.ndarray:
+    c = np.asarray(center_xy, np.float32).reshape(1, 2)
+    p = np.asarray(pts, np.float32).reshape(-1, 2)
+    return ((p - c) * float(scale) + c).astype(np.float32)
+
+
+def _arrow_poly_pts(p0_xy, p1_xy, shaft_w: float, head_len: float, head_w: float) -> np.ndarray:
+    p0 = np.asarray(p0_xy, np.float32).reshape(2)
+    p1 = np.asarray(p1_xy, np.float32).reshape(2)
+    v = p1 - p0
+    L = float(np.hypot(v[0], v[1]))
+    if L < 1e-6:
+        return np.zeros((0, 2), np.float32)
+
+    u = v / L
+    n = np.array([-u[1], u[0]], np.float32)
+
+    shaft_w = float(max(2.0, shaft_w))
+    head_len = float(np.clip(head_len, max(6.0, 0.85 * shaft_w), max(8.0, 0.78 * L)))
+    head_w = float(max(head_w, shaft_w * 1.55))
+
+    ps = p1 - u * head_len
+    pts = np.array([
+        p0 + n * (0.50 * shaft_w),
+        ps + n * (0.50 * shaft_w),
+        ps + n * (0.50 * head_w),
+        p1,
+        ps - n * (0.50 * head_w),
+        ps - n * (0.50 * shaft_w),
+        p0 - n * (0.50 * shaft_w),
+    ], np.float32)
+    return pts
+
+
 def _draw_io_ring_and_arrow(img, roi):
-    x,y,w,h = map(int, roi.rect)
-    cx, cy = x + w//2, y + h//2
-    r = max(8, min(w,h)//2 - 4)
+    x, y, w, h = map(int, roi.rect)
+    cx, cy = x + w // 2, y + h // 2
+    rad = max(12, min(w, h) // 2 - 4)
 
-    # resolve the single angle and mirror into legacy fields
-    deg = float(getattr(roi, "io_dir_deg", 0.0)) % 360.0
-    roi.dir_gate_deg = deg
-    roi.dir_io_deg   = deg
+    # Resolve the single angle and mirror into legacy fields.
+    yaw = float(getattr(roi, "io_dir_deg", 0.0)) % 360.0
+    roi.dir_gate_deg = yaw
+    roi.dir_io_deg = yaw
 
-    th = math.radians(deg)
-    ex = int(round(cx + r * math.cos(th)))
-    ey = int(round(cy + r * math.sin(th)))
+    elev = float(np.clip(getattr(roi, "axis_elev_deg", 0.0), -89.0, 89.0))
+    yaw_r = math.radians(yaw)
+    elev_r = math.radians(elev)
 
-    # ROI ring
-    cv.circle(img, (cx,cy), r, (180,180,180), 1, cv.LINE_AA)
+    # Screen-space direction comes from yaw; pitch controls projection length + lean.
+    dxy = np.array([math.cos(yaw_r), math.sin(yaw_r)], np.float32)
+    c_e = max(0.15, abs(math.cos(elev_r)))
+    z_n = float(np.clip(math.sin(elev_r), -1.0, 1.0))
 
-    # IN arrow (toward io_dir)
-    cv.arrowedLine(img, (cx,cy), (ex,ey), (0,220,255), 2, tipLength=0.20)
+    tip_len = float(rad * (0.45 + 0.80 * c_e))
+    tail_len = float(rad * (0.18 + 0.20 * c_e))
+    p0 = np.array([cx, cy], np.float32) - dxy * tail_len
+    p1 = np.array([cx, cy], np.float32) + dxy * tip_len
 
-    # OUT arrow (opposite, dim)
-    ex2 = int(round(cx - r * math.cos(th)))
-    ey2 = int(round(cy - r * math.sin(th)))
-    cv.arrowedLine(img, (cx,cy), (ex2,ey2), (140,140,140), 1, tipLength=0.18)
+    shaft_w = float(max(6.0, 0.22 * rad + 7.0))
+    head_len = float(max(10.0, 1.35 * shaft_w))
+    head_w = float(max(16.0, 1.90 * shaft_w))
+    poly_front = _arrow_poly_pts(p0, p1, shaft_w=shaft_w, head_len=head_len, head_w=head_w)
+    if poly_front.size == 0:
+        roi.dir_hit = (cx - rad - 12, cy - rad - 12, 2 * (rad + 12), 2 * (rad + 12))
+        return
 
-    elev = float(getattr(roi, "axis_elev_deg", 0.0))
-    nz = math.sin(math.radians(elev))  # -1..+1; sign = away/toward
-    rr = max(3, int(4 + 10*abs(nz)))
-    if nz >= 0:
-        cv.circle(img, (ex,ey), rr, (0,210,0), 1, cv.LINE_AA)   # toward
+    # Pseudo-camera depth axis. This is purely visual: it makes pitch feel like a lean
+    # toward/away from the camera instead of a separate glyph or text readout.
+    cam_axis = np.array([-0.72, -0.56], np.float32)
+    depth_px = float((0.15 + 0.95 * abs(z_n)) * (0.38 * rad + 5.0))
+    depth_off = cam_axis * depth_px * (1.0 if z_n >= 0.0 else -1.0)
+
+    # Toward camera = slightly larger front face; away = slightly smaller front face.
+    if z_n >= 0.0:
+        poly_face = _poly_scale_about(poly_front, p0, 1.00 + 0.12 * abs(z_n))
+        poly_back = _poly_scale_about(poly_front + depth_off.reshape(1, 2), p0 + depth_off, 1.00 - 0.05 * abs(z_n))
+        front_col = (30, 235, 255)
+        back_col = _mul_bgr(front_col, 0.45)
     else:
-        c=(255,0,255); s=max(2, rr-1)
-        cv.line(img, (ex-s,ey-s), (ex+s,ey+s), c, 1, cv.LINE_AA)
-        cv.line(img, (ex-s,ey+s), (ex+s,ey-s), c, 1, cv.LINE_AA)
-    # label pitch (compact)
-    draw_text_clamped(img, f"pitch {elev:+.0f}°", cx + r + 6, cy - 2, (220,220,220), 0.45)
+        poly_face = _poly_scale_about(poly_front, p0, 1.00 - 0.08 * abs(z_n))
+        poly_back = _poly_scale_about(poly_front + depth_off.reshape(1, 2), p0 + depth_off, 1.00 + 0.08 * abs(z_n))
+        front_col = (30, 190, 225)
+        back_col = _mul_bgr(front_col, 0.55)
 
-    # hitbox so clicks/wheel can target the compass reliably
-    roi.dir_hit = (cx - r - 6, cy - r - 6, 2*(r + 6), 2*(r + 6))
+    poly_face_i = np.round(poly_face).astype(np.int32).reshape(-1, 1, 2)
+    poly_back_i = np.round(poly_back).astype(np.int32).reshape(-1, 1, 2)
 
+    # Soft base glow so the AOI control reads like a manipulable object.
+    overlay = img.copy()
+    hub_r = int(max(5, 0.20 * shaft_w))
+    cv.circle(overlay, (int(round(p0[0])), int(round(p0[1]))), int(rad * 0.22) + 5, (32, 32, 32), -1, cv.LINE_AA)
+    cv.addWeighted(overlay, 0.18, img, 0.82, 0, img)
+
+    # Back face first.
+    cv.fillPoly(img, [poly_back_i], back_col, lineType=cv.LINE_AA)
+
+    # Connector rails give the arrow a clear lean toward/away from camera.
+    side_col = _mul_bgr(front_col, 0.68)
+    face_pts = np.round(poly_face).astype(np.int32)
+    back_pts = np.round(poly_back).astype(np.int32)
+    for a, b in zip(face_pts, back_pts):
+        cv.line(img, tuple(int(v) for v in a), tuple(int(v) for v in b), side_col, max(1, int(round(0.22 * shaft_w))), cv.LINE_AA)
+
+    # Main face.
+    cv.fillPoly(img, [poly_face_i], front_col, lineType=cv.LINE_AA)
+    cv.polylines(img, [poly_back_i], True, (10, 10, 10), 1, cv.LINE_AA)
+    cv.polylines(img, [poly_face_i], True, (12, 12, 12), max(1, int(round(0.16 * shaft_w))), cv.LINE_AA)
+
+    # Small hub cap so the control reads as attached to the ROI.
+    cv.circle(img, (int(round(p0[0])), int(round(p0[1]))), hub_r + 1, (10, 10, 10), -1, cv.LINE_AA)
+    cv.circle(img, (int(round(p0[0])), int(round(p0[1]))), hub_r, (220, 220, 220), 1, cv.LINE_AA)
+
+    # Hitbox from both faces, padded.
+    all_pts = np.vstack([poly_face, poly_back])
+    x0 = int(np.floor(np.min(all_pts[:, 0]) - 10))
+    y0 = int(np.floor(np.min(all_pts[:, 1]) - 10))
+    x1 = int(np.ceil(np.max(all_pts[:, 0]) + 10))
+    y1 = int(np.ceil(np.max(all_pts[:, 1]) + 10))
+    roi.dir_hit = (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 def _cd_kernel(r, second=False):
     k = np.zeros(2*r+1, np.float32)
@@ -5451,14 +5535,21 @@ class ROI:
     impact_flip_deadband_ps: float = V_ZERO  # deadband for IN/OUT sign decisions (px/s-ish)
 
 
-    # Half-angle of the lateral cone around yaw+90° (deg).
-    # 0 < lat_half_deg < 90; wider cone = more tolerant sway.
+    # Legacy lateral-cone knobs kept for backward compatibility.
+    # Semantic lateral export no longer uses yaw+90; it now comes from residual camera-depth (Z).
     lat_half_deg: float = 70.0
-    # Shape of lateral weighting: ((cosθ - cos(lat_half)) / (1-cos(lat_half))) ** lat_power
     lat_power: float    = 1.0
 
+    # Semantic sway / raise tuning (preview + CSV export)
+    lat_z_gain: float = 0.40              # base gain for depth-derived sway
+    lat_z_lowconf_scale: float = 0.15     # extra suppression on low-confidence frames
+    lat_z_conf_pow: float = 1.35          # >1 = more conservative
+    lat_z_coh_ms: int = 120               # temporal sign-coherence window for depth sway
 
-    
+    raise_y_gain: float = 1.00            # vertical / raise lane gain
+    raise_y_lowconf_scale: float = 0.55   # observed Y is safer, so gate it less harshly than Z
+    raise_y_conf_pow: float = 1.00
+    raise_y_coh_ms: int = 90
 
 
     refractory_ms: int = 140                   # wheel on 'Ref' to change (40..400)
@@ -7495,8 +7586,7 @@ class DeformTracker:
 
         _draw_io_ring_and_arrow(vis, roi)
         mode = str(getattr(roi, "axis_mode", "off"))
-        pitch = float(getattr(roi, "axis_elev_deg", 0.0))
-        draw_text_clamped(vis, f"AOI {mode}  pitch {pitch:+.0f}°", x+6, y-22, (220,220,220), 0.45)
+        draw_text_clamped(vis, "AOI drag | wheel/MMB lean", x+6, y-22, (220,220,220), 0.45)
         draw_text_clamped(vis, f"Z-Scale: {roi.z_scale_mode}", x+6, y-36, (220, 220, 220), 0.45)
 
 
@@ -7562,7 +7652,6 @@ def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
         "roi_lowconf",
         "roi_igE", "roi_igdE", "roi_curv",
     ):
-        _trim_dict(getattr(sc2, nm, None))
         _trim_dict(getattr(sc2, nm, None))
 
     try:
@@ -8329,55 +8418,6 @@ def interpolate_over_dups(values, dup_flags):
 
     return out
 
-def infer_stutter_flags(vx, vy, vz,
-                        dip_ratio: float = 0.20,
-                        dir_cos: float = 0.75,
-                        neigh_pctl: float = 90.0,
-                        neigh_floor_frac: float = 0.08,
-                        dip_floor_frac: float = 0.03):
-    """
-    Conservative fallback for recorded LIVE lanes when dup_flags/lowconf were not
-    captured (older scenes / pre-patch sessions).
-
-    Marks one-frame "motion -> almost zero -> same motion" dips. Those are the
-    classic duplicate/interference artifacts that show up as direction resetting to
-    ~0 between two aligned non-trivial motion samples.
-
-    Returns a boolean mask aligned to the input arrays.
-    """
-    vx = _np.asarray(vx, _np.float64)
-    vy = _np.asarray(vy, _np.float64)
-    vz = _np.asarray(vz, _np.float64)
-    n = int(min(vx.size, vy.size, vz.size))
-    if n < 3:
-        return _np.zeros(max(0, n), bool)
-
-    vx = vx[:n]; vy = vy[:n]; vz = vz[:n]
-    sp = _np.sqrt(vx*vx + vy*vy + vz*vz)
-    if not _np.any(_np.isfinite(sp)):
-        return _np.zeros(n, bool)
-
-    ref = float(_np.percentile(sp, float(neigh_pctl))) if n else 0.0
-    neigh_floor = max(1e-6, float(neigh_floor_frac) * ref)
-    dip_floor   = max(1e-6, float(dip_floor_frac) * ref)
-
-    out = _np.zeros(n, bool)
-    for i in range(1, n - 1):
-        s0 = float(sp[i - 1]); s1 = float(sp[i]); s2 = float(sp[i + 1])
-        neigh = min(s0, s2)
-        if neigh < neigh_floor:
-            continue
-        if s1 > max(dip_floor, float(dip_ratio) * neigh):
-            continue
-
-        dot = float(vx[i - 1]*vx[i + 1] + vy[i - 1]*vy[i + 1] + vz[i - 1]*vz[i + 1])
-        denom = (s0 * s2) + 1e-9
-        if (dot / denom) < float(dir_cos):
-            continue
-
-        out[i] = True
-
-    return out
 
 def robust_smooth(x, fps, win_ms=140, ema_tc_ms=200, mad_k=3.5):
     x = _np.asarray(x, _np.float64)
@@ -8467,6 +8507,224 @@ def normalize_signed11(x):
     x=_np.asarray(x,_np.float64)
     mx=_np.max(_np.abs(x))+1e-12
     return x/mx
+
+
+def infer_stutter_flags(vx, vy, vz,
+                        dip_ratio: float = 0.20,
+                        dir_cos: float = 0.75,
+                        neigh_pctl: float = 90.0,
+                        neigh_floor_frac: float = 0.08,
+                        dip_floor_frac: float = 0.03):
+    """
+    Conservative fallback for older/live-recorded lanes when dup_flags / roi_lowconf
+    were not captured. Marks one-frame motion -> almost-zero -> same-motion dips.
+    """
+    vx = _np.asarray(vx, _np.float64)
+    vy = _np.asarray(vy, _np.float64)
+    vz = _np.asarray(vz, _np.float64)
+    n = int(min(vx.size, vy.size, vz.size))
+    if n < 3:
+        return _np.zeros(max(0, n), bool)
+
+    vx = vx[:n]; vy = vy[:n]; vz = vz[:n]
+    sp = _np.sqrt(vx*vx + vy*vy + vz*vz)
+    if not _np.any(_np.isfinite(sp)):
+        return _np.zeros(n, bool)
+
+    ref = float(_np.percentile(sp, float(neigh_pctl))) if n else 0.0
+    neigh_floor = max(1e-6, float(neigh_floor_frac) * ref)
+    dip_floor   = max(1e-6, float(dip_floor_frac) * ref)
+
+    out = _np.zeros(n, bool)
+    for i in range(1, n - 1):
+        s0 = float(sp[i - 1]); s1 = float(sp[i]); s2 = float(sp[i + 1])
+        neigh = min(s0, s2)
+        if neigh < neigh_floor:
+            continue
+        if s1 > max(dip_floor, float(dip_ratio) * neigh):
+            continue
+
+        dot = float(vx[i - 1]*vx[i + 1] + vy[i - 1]*vy[i + 1] + vz[i - 1]*vz[i + 1])
+        denom = (s0 * s2) + 1e-9
+        if (dot / denom) < float(dir_cos):
+            continue
+
+        out[i] = True
+
+    return out
+
+
+def _fit_series_len(a, T: int, fill=0.0, dtype=_np.float64):
+    T = int(max(0, T))
+    out = _np.asarray(a if a is not None else [], dtype=dtype)
+    if out.size == 0:
+        return _np.full(T, fill, dtype=dtype)
+    if out.size < T:
+        out = _np.pad(out, (0, T - out.size), mode="edge")
+    if out.size > T:
+        out = out[:T]
+    return out
+
+
+def _robust_abs01(x, p_hi: float = 90.0):
+    x = _np.asarray(x, _np.float64)
+    if x.size == 0:
+        return _np.zeros(0, _np.float64)
+    a = _np.abs(x)
+    finite = a[_np.isfinite(a)]
+    if finite.size == 0:
+        return _np.zeros_like(a)
+    hi = float(_np.percentile(finite, float(p_hi)))
+    if (not _np.isfinite(hi)) or hi <= 1e-9:
+        return _np.zeros_like(a)
+    return _np.clip(a / hi, 0.0, 1.0)
+
+
+def _moving_mean1d(x, win: int):
+    x = _np.asarray(x, _np.float64)
+    n = int(x.size)
+    if n == 0:
+        return x
+    win = int(max(1, win))
+    if win <= 1:
+        return x.copy()
+    pad = win // 2
+    xp = _np.pad(x, (pad, pad), mode="edge")
+    k = _np.ones(win, _np.float64) / float(win)
+    y = _np.convolve(xp, k, mode="valid")
+    return y[:n]
+
+
+def _sign_coherence01(x, fps: float, win_ms: float = 120.0, dead_frac: float = 0.10):
+    x = _np.asarray(x, _np.float64)
+    if x.size == 0:
+        return _np.zeros(0, _np.float64)
+    amp01 = _robust_abs01(x, 90.0)
+    ref = float(_np.percentile(_np.abs(x), 90.0)) if x.size else 0.0
+    dead = max(1e-6, float(dead_frac) * ref)
+    s = _np.zeros_like(x, _np.float64)
+    s[x >  dead] =  1.0
+    s[x < -dead] = -1.0
+    win = max(1, int(round(float(win_ms) * float(fps) / 1000.0)))
+    coh = _np.abs(_moving_mean1d(s, win))
+    return _np.clip(coh * _np.maximum(0.25, amp01), 0.0, 1.0)
+
+
+def _semantic_motion_lanes(vx_s, vy_s, vz_s, fps: float, r,
+                           *, lowconf=None, curv=None, igdE=None):
+    """
+    Semantic decomposition used by preview/export:
+      - axis_*  = user AoI in 3D
+      - lat_*   = camera-depth sway (residual Z), heavily confidence-gated
+      - raise_* = vertical raise/lift (residual screen Y), directly observed
+
+    The key change is that lateral is no longer "AoI rotated by +90°". It is the
+    residual depth component after subtracting the primary AoI motion.
+    """
+    vx_s = _np.asarray(vx_s, _np.float64)
+    vy_s = _np.asarray(vy_s, _np.float64)
+    vz_s = _np.asarray(vz_s, _np.float64)
+    T = int(min(vx_s.size, vy_s.size, vz_s.size))
+    if T <= 0:
+        z = _np.zeros(0, _np.float64)
+        return {
+            "v_al": z, "a_al": z, "j_al": z,
+            "axis_v11": z, "axis_acc11": z, "axis_jerk11": z, "axis_dir11": z,
+            "lat_v11": z, "lat_acc11": z, "lat_jerk11": z, "lat_dir11": z, "lat_amp01": z,
+            "raise_v11": z, "raise_acc11": z, "raise_jerk11": z, "raise_dir11": z, "raise_amp01": z,
+        }
+
+    vx_s = vx_s[:T]; vy_s = vy_s[:T]; vz_s = vz_s[:T]
+    dt = 1.0 / max(1e-6, float(fps))
+
+    yaw  = float(getattr(r, "io_dir_deg", getattr(r, "dir_gate_deg", 0.0)) or 0.0)
+    elev = float(getattr(r, "axis_elev_deg", 0.0) or 0.0)
+    kz   = float(getattr(r, "axis_z_scale", 1.0) or 1.0)
+    ax_u, ay_u, az_u = _axis_unit3d(yaw, elev)
+
+    vx3 = vx_s
+    vy3 = vy_s
+    vz3 = kz * vz_s
+    vmag = _np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12
+
+    # Primary AoI motion in the user-defined 3D direction.
+    v_al = vx3*ax_u + vy3*ay_u + vz3*az_u
+    a_al = _deriv_central(v_al, dt)
+    j_al = _deriv_central(a_al, dt)
+
+    axis_v11    = normalize_signed11(v_al)
+    axis_acc11  = normalize_signed11(a_al)
+    axis_jerk11 = normalize_signed11(j_al)
+    axis_dir11  = normalize_signed11(v_al)
+
+    # Remove primary motion, then interpret the residual semantically.
+    vpy = v_al * ay_u
+    vpz = v_al * az_u
+    v_raise_res = vy3 - vpy
+    v_lat_res   = vz3 - vpz
+
+    lowconf = _fit_series_len(lowconf, T, fill=False, dtype=bool)
+    curv    = _fit_series_len(curv,    T, fill=0.0,  dtype=_np.float64)
+    igdE    = _fit_series_len(igdE,    T, fill=0.0,  dtype=_np.float64)
+
+    low_lat_scale = float(_np.clip(getattr(r, "lat_z_lowconf_scale", 0.15), 0.0, 1.0))
+    low_raise_scale = float(_np.clip(getattr(r, "raise_y_lowconf_scale", 0.55), 0.0, 1.0))
+    speed_gate = _np.ones(T, _np.float64)
+    vmin_ps = float(getattr(r, "impact_min_speed_ps", 0.0))
+    if vmin_ps > 0.0:
+        speed_gate = _np.clip(vmag / vmin_ps, 0.0, 1.0)
+
+    curv01  = _robust_abs01(curv, 90.0)
+    igdE01  = _robust_abs01(igdE, 90.0)
+    lat01   = _robust_abs01(v_lat_res, 90.0)
+    raise01 = _robust_abs01(v_raise_res, 90.0)
+
+    lat_coh = _sign_coherence01(v_lat_res, fps, win_ms=float(getattr(r, "lat_z_coh_ms", 120.0)))
+    raise_coh = _sign_coherence01(v_raise_res, fps, win_ms=float(getattr(r, "raise_y_coh_ms", 90.0)))
+
+    low_gate_lat = _np.where(lowconf, low_lat_scale, 1.0)
+    low_gate_raise = _np.where(lowconf, low_raise_scale, 1.0)
+
+    z_conf = low_gate_lat * speed_gate * lat01 * (0.20 + 0.80*curv01) * (0.20 + 0.80*igdE01) * (0.25 + 0.75*lat_coh)
+    z_conf = _np.clip(z_conf, 0.0, 1.0)
+    z_conf = _np.power(z_conf, float(max(1e-6, getattr(r, "lat_z_conf_pow", 1.35))))
+
+    raise_conf = low_gate_raise * speed_gate * raise01 * (0.30 + 0.70*raise_coh)
+    raise_conf = _np.clip(raise_conf, 0.0, 1.0)
+    raise_conf = _np.power(raise_conf, float(max(1e-6, getattr(r, "raise_y_conf_pow", 1.0))))
+
+    v_lat = float(getattr(r, "lat_z_gain", 0.40)) * v_lat_res * z_conf
+    v_raise = float(getattr(r, "raise_y_gain", 1.00)) * v_raise_res * raise_conf
+
+    a_lat = _deriv_central(v_lat, dt)
+    j_lat = _deriv_central(a_lat, dt)
+    a_raise = _deriv_central(v_raise, dt)
+    j_raise = _deriv_central(a_raise, dt)
+
+    speed_ref = float(_np.percentile(vmag, 95.0)) if _np.any(_np.isfinite(vmag)) else 0.0
+    speed_ref = max(1e-6, speed_ref)
+
+    lat_amp01 = _np.clip(_np.abs(v_lat) / speed_ref, 0.0, 1.0)
+    raise_amp01 = _np.clip(_np.abs(v_raise) / speed_ref, 0.0, 1.0)
+
+    lat_dir11 = normalize_signed11(v_lat)
+    raise_dir11 = normalize_signed11(v_raise)
+
+    lat_v11    = lat_dir11 * lat_amp01
+    lat_acc11  = normalize_signed11(a_lat) * lat_amp01
+    lat_jerk11 = normalize_signed11(j_lat) * lat_amp01
+
+    raise_v11    = raise_dir11 * raise_amp01
+    raise_acc11  = normalize_signed11(a_raise) * raise_amp01
+    raise_jerk11 = normalize_signed11(j_raise) * raise_amp01
+
+    return {
+        "v_al": v_al, "a_al": a_al, "j_al": j_al,
+        "axis_v11": axis_v11, "axis_acc11": axis_acc11, "axis_jerk11": axis_jerk11, "axis_dir11": axis_dir11,
+        "lat_v11": lat_v11, "lat_acc11": lat_acc11, "lat_jerk11": lat_jerk11, "lat_dir11": lat_dir11, "lat_amp01": lat_amp01,
+        "raise_v11": raise_v11, "raise_acc11": raise_acc11, "raise_jerk11": raise_jerk11, "raise_dir11": raise_dir11, "raise_amp01": raise_amp01,
+    }
+
 
 def smooth_and_scale_xy(cx, cy, fps, up=3):
     t = _np.arange(len(cx), dtype=_np.float64)/float(fps)
@@ -9229,6 +9487,10 @@ def export_fullpass_overlay_and_csv(video_path, scenes, suffix="_exported_overla
                 low = np.asarray(low, bool)
                 flags = low if flags is None else (flags | low)
 
+            stutter = infer_stutter_flags(vx, vy, vz)
+            if np.any(stutter):
+                flags = stutter if flags is None else (flags | stutter)
+
             if flags is not None:
                 vx = interpolate_over_dups(vx, flags)
                 vy = interpolate_over_dups(vy, flags)
@@ -9503,6 +9765,7 @@ def _cc_range_kind(col: str) -> str:
     col = str(col)
     if any(col.endswith(suf) for suf in ("_axis_v", "_axis_acc", "_axis_jerk", "_axis_dir",
                                         "_lat_v", "_lat_acc", "_lat_jerk", "_lat_dir",
+                                        "_raise_v", "_raise_acc", "_raise_jerk", "_raise_dir",
                                         "_cam_log2_signed")):
         return "bipolar"
     if col.endswith("_deg"):
@@ -9555,6 +9818,11 @@ _LOCAL_CC_MAP = {
     "lat_jerk": 37,
     "lat_dir": 38,
     "lat_amp01": 39,
+    "raise_v": 48,
+    "raise_acc": 49,
+    "raise_jerk": 50,
+    "raise_dir": 51,
+    "raise_amp01": 52,
     # impacts
     "impact_score01": 40,
     "impact_in01": 41,
@@ -9585,6 +9853,7 @@ def _local_lane_key(col: str) -> Optional[str]:
         "dirx01", "diry01", "dirz01",
         "axis_v", "axis_acc", "axis_jerk", "axis_dir",
         "lat_v", "lat_acc", "lat_jerk", "lat_dir", "lat_amp01",
+        "raise_v", "raise_acc", "raise_jerk", "raise_dir", "raise_amp01",
         "impact_in01", "impact_out01",
         "impact_in_spk01", "impact_out_spk01",
         "impact_score01",
@@ -10013,7 +10282,7 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         T  = len(vx)
         dt = 1.0/max(1e-6, float(fps))
 
-        # optional: same dup+lowconf interpolation used by overlay export
+        # duplicate / low-confidence / stutter repair (shared with preview intent)
         flags = None
         if getattr(sc, "dup_flags", None) and len(sc.dup_flags) == T:
             flags = _np.asarray(sc.dup_flags, bool)
@@ -10023,8 +10292,6 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             low = _np.asarray(low, bool)
             flags = low if flags is None else (flags | low)
 
-        # Fallback for older live scenes that never recorded dup_flags/lowconf:
-        # detect one-frame motion dropouts and repair them the same way.
         stutter = infer_stutter_flags(vx, vy, vz)
         if _np.any(stutter):
             flags = stutter if flags is None else (flags | stutter)
@@ -10036,6 +10303,9 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             vy = interpolate_over_dups(vy, flags)
             vz = interpolate_over_dups(vz, flags)
 
+        curv = _pad(getattr(sc, "roi_curv", {}), ri, 0.0)
+        igdE = _pad(getattr(sc, "roi_igdE", {}), ri, 0.0)
+        lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(ri, []), T, fill=False, dtype=bool)
 
         # pos/dir/env/speed/acc/jerk (unchanged behavior)
         if getattr(r, 'bound', None):
@@ -10081,24 +10351,19 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
         jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
-        # === Axis-of-interest (AoI) + Lateral 1-D kinematics ===
-
-        # AoI axis in 3D (thrust)
-        yaw  = float(getattr(r, "io_dir_deg", getattr(r, "dir_gate_deg", 0.0)))
-        elev = float(getattr(r, "axis_elev_deg", 0.0))
-        kz   = float(getattr(r, "axis_z_scale", 1.0))
-        ax_u, ay_u, az_u = _axis_unit3d(yaw, elev)
-
-        # 3D velocity in matched units
-        vx3 = vx_s
-        vy3 = vy_s
-        vz3 = kz * vz_s
-        vmag = _np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12  # total speed px/s
-
-        # --- AoI (thrust) along-axis component ---
-        v_al = vx3*ax_u + vy3*ay_u + vz3*az_u
-        a_al = _deriv_central(v_al, dt)
-        j_al = _deriv_central(a_al, dt)
+        # Semantic motion decomposition:
+        #   axis_*  = user AoI in 3D
+        #   lat_*   = confidence-gated camera-depth sway (residual Z)
+        #   raise_* = vertical raise/lift (residual screen Y)
+        kin = _semantic_motion_lanes(
+            vx_s, vy_s, vz_s, fps, r,
+            lowconf=lowconf,
+            curv=curv,
+            igdE=igdE,
+        )
+        v_al = kin["v_al"]
+        a_al = kin["a_al"]
+        j_al = kin["j_al"]
 
         # ---------------- IMPACT HIT SPIKES (jerk-based, instantaneous) ----------------
         # Why: IN/OUT lanes are "state/phase" (regions). We also want punctual collision instants.
@@ -10146,53 +10411,22 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         # -------------------------------------------------------------------------------
 
 
-        axis_v11    = normalize_signed11(v_al)
-        axis_acc11  = normalize_signed11(a_al)
-        axis_jerk11 = normalize_signed11(j_al)
-        axis_dir11  = normalize_signed11(v_al)  # stroke direction: -1..+1
+        axis_v11    = kin["axis_v11"]
+        axis_acc11  = kin["axis_acc11"]
+        axis_jerk11 = kin["axis_jerk11"]
+        axis_dir11  = kin["axis_dir11"]
 
-        # --- Lateral cone: axis = AoI rotated by +90° yaw (hip sway L/R) ---
-        lx_u, ly_u, lz_u = _axis_unit3d(yaw + 90.0, elev)
+        lat_v11     = kin["lat_v11"]
+        lat_acc11   = kin["lat_acc11"]
+        lat_jerk11  = kin["lat_jerk11"]
+        lat_dir11   = kin["lat_dir11"]
+        lat_amp01   = kin["lat_amp01"]
 
-        # signed velocity along lateral axis (perpendicular to AoI)
-        v_lat_signed = vx3*lx_u + vy3*ly_u + vz3*lz_u
-
-        # cosine of angle to lateral axis (symmetric for ±)
-        cos_lat = _np.abs(v_lat_signed / vmag)
-
-        # lateral cone weight w_lat in [0,1]
-        lat_half = float(getattr(r, "lat_half_deg", 30.0))
-        lat_pow  = float(getattr(r, "lat_power", 4.0))
-        if 0.0 < lat_half < 90.0:
-            cos_min = math.cos(math.radians(lat_half))
-            w_lat = _np.zeros_like(cos_lat)
-            mask = cos_lat >= cos_min
-            if _np.any(mask):
-                # ramp from 0 at edge of cone to 1 on-axis
-                w_lat[mask] = ((cos_lat[mask] - cos_min) /
-                               max(1e-6, 1.0 - cos_min)) ** lat_pow
-        else:
-            # fallback: pure |cos|^p weighting
-            w_lat = cos_lat ** lat_pow
-
-        # optional speed gate: kill micro motions
-        vmin_ps = float(getattr(r, "impact_min_speed_ps", 0.0))
-        if vmin_ps > 0.0:
-            gate_v = _np.clip(vmag / vmin_ps, 0.0, 1.0)
-            w_lat *= gate_v
-
-        # weighted lateral velocity & derivatives
-        v_lat_w = v_lat_signed * w_lat
-        a_lat   = _deriv_central(v_lat_w, dt)
-        j_lat   = _deriv_central(a_lat, dt)
-
-        # normalized lateral lanes
-        lat_v11    = normalize_signed11(v_lat_w)          # signed L/R sway
-        lat_acc11  = normalize_signed11(a_lat)
-        lat_jerk11 = normalize_signed11(j_lat)
-        lat_dir11  = lat_v11                               # alias: "direction"
-        lat_amp01  = normalize_unsigned01(_np.abs(v_lat_w))  # 0..1 sway intensity
-
+        raise_v11    = kin["raise_v11"]
+        raise_acc11  = kin["raise_acc11"]
+        raise_jerk11 = kin["raise_jerk11"]
+        raise_dir11  = kin["raise_dir11"]
+        raise_amp01  = kin["raise_amp01"]
 
         # --- NEW: center-based velocities ---
         vx_pos_raw, vy_pos_raw = _center_vel_from_pos(cx, cy, fps)
@@ -10381,12 +10615,19 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             rows[f"{label}_axis_jerk"] = axis_jerk11.tolist()
             rows[f"{label}_axis_dir"]  = axis_dir11.tolist()
 
-            # Lateral cone lanes (perpendicular to AoI)
-            rows[f"{label}_lat_v"]      = lat_v11.tolist()     # signed left/right, -1..+1
-            rows[f"{label}_lat_acc"]    = lat_acc11.tolist()   # signed
-            rows[f"{label}_lat_jerk"]   = lat_jerk11.tolist()  # signed
-            rows[f"{label}_lat_dir"]    = lat_dir11.tolist()   # alias of lat_v
-            rows[f"{label}_lat_amp01"]  = lat_amp01.tolist()   # 0..1 sway amplitude
+            # Semantic sway lanes (camera-depth / Z)
+            rows[f"{label}_lat_v"]      = lat_v11.tolist()
+            rows[f"{label}_lat_acc"]    = lat_acc11.tolist()
+            rows[f"{label}_lat_jerk"]   = lat_jerk11.tolist()
+            rows[f"{label}_lat_dir"]    = lat_dir11.tolist()
+            rows[f"{label}_lat_amp01"]  = lat_amp01.tolist()
+
+            # Semantic raise lanes (vertical / Y)
+            rows[f"{label}_raise_v"]      = raise_v11.tolist()
+            rows[f"{label}_raise_acc"]    = raise_acc11.tolist()
+            rows[f"{label}_raise_jerk"]   = raise_jerk11.tolist()
+            rows[f"{label}_raise_dir"]    = raise_dir11.tolist()
+            rows[f"{label}_raise_amp01"]  = raise_amp01.tolist()
 
 
         # === IMPACTS: mirror export_fullpass ===
@@ -10742,7 +10983,7 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 try:
     from PySide6 import QtWidgets, QtGui, QtCore
 except Exception as _e:
-    QtWidgets = None  # fallback if not installed
+    QtWidgets = QtGui = QtCore = None  # fallback if not installed
 
 
 class _VideoDecodeThread(QtCore.QThread):
@@ -10915,21 +11156,18 @@ class _WheelIOFilter(QtCore.QObject):
 
             steps = ev.angleDelta().y() / 120.0
 
+            # Wheel over an ROI now controls AOI Z / pitch directly.
+            # Yaw is set by dragging the AOI compass itself.
+            fine = 1.0 if alt else 4.0
             if shift:
-                # SHIFT+WHEEL → adjust pitch only (no yaw drift)
-                fine = 1.0 if alt else 4.0         # Alt makes it fine
-                r.axis_elev_deg = float(np.clip(getattr(r, "axis_elev_deg", 0.0) + fine*steps, -89.0, +89.0))
-                ev.accept()
-                return True
-            else:
-                # plain wheel over ROI → yaw (existing behavior)
-                delta = (1.0 if alt else 5.0) * steps
-                val = (float(getattr(r, "io_dir_deg", 0.0)) + float(delta)) % 360.0
-                r.io_dir_deg  = val
-                r.dir_gate_deg = val
-                r.dir_io_deg   = val
-                ev.accept()
-                return True
+                fine *= 0.5
+            r.axis_elev_deg = float(np.clip(getattr(r, "axis_elev_deg", 0.0) + fine*steps, -89.0, +89.0))
+            try:
+                obj.update()
+            except Exception:
+                pass
+            ev.accept()
+            return True
         return False
 
 
@@ -11170,7 +11408,7 @@ def run_qt(video_path):
     "Ctrl+Wheel fast scrub | Shift+Wheel scene jump | Ctrl+Z undo | Ctrl+Shift+Z / Ctrl+Y redo",
     "N new scene | A set scene start | D set scene end | E end/export | Shift+E reopen end",
     "U add ROI | R repick ROI | Shift+Drag bound | Ctrl+Drag anchor | [ / ] select ROI",
-    "Double-click ROI: rename | Shift+Backspace: delete ROI | P export scene | S export all scenes",
+    "Right-click ROI: rename | Ctrl+Right-click ROI: postview | Shift+Backspace: delete ROI",
     "Debug: Ctrl+D flow | Ctrl+B blobs | H toggle ROI debug overlay",
     "AI opt-in: Ctrl+T tags | Ctrl+I impacts | Ctrl+F flux-fix | Ctrl+O occlusion | Ctrl+M outline",
     "Mask: Ctrl+Shift+M inc/exc | Ctrl+Alt+M IG-LoG mask | Ctrl+Backspace clear mask"
@@ -13471,28 +13709,66 @@ def run_qt(video_path):
             ox, oy = self.view_offset; s = self.view_scale if self.view_scale>0 else 1.0
             cx = int(np.clip(round((x-ox)/s), 0, self.W-1)); cy = int(np.clip(round((y-oy)/s), 0, self.H-1))
             return cx, cy
-        
+
+        def _set_roi_aoi_from_point(self, si, ri, cx, cy):
+            if si < 0 or ri < 0 or si >= len(self.scenes) or ri >= len(self.scenes[si].rois):
+                return False
+            r = self.scenes[si].rois[ri]
+            rx, ry, rw, rh = map(float, r.rect)
+            ccx = rx + rw / 2.0
+            ccy = ry + rh / 2.0
+            dx = float(cx) - ccx
+            dy = float(cy) - ccy
+            if abs(dx) + abs(dy) < 2.0:
+                return False
+            yaw = float(math.degrees(math.atan2(dy, dx)) % 360.0)
+            r.io_dir_deg = yaw
+            r.dir_gate_deg = yaw
+            r.dir_io_deg = yaw
+            self.scenes[si].rois[ri] = r
+            return True
+
         def on_middle_down(self, x, y, mods):
+            cx, cy = self._to_content(x, y)
+            si = self.active_scene
+            if si < 0 or not self.scenes[si].rois:
+                self.mmb_drag = False
+                return
+            ri = self.find_roi_at(si, cx, cy)
+            if ri < 0:
+                ri = self.active_roi
+            if ri < 0 or ri >= len(self.scenes[si].rois):
+                self.mmb_drag = False
+                return
+            self._push_undo("Adjust AOI Z", coalesce="roi_aoi")
+            self.active_roi = ri
             self.mmb_drag = True
+            self.mmb_roi = ri
             self.mmb_anchor = self._to_content(x, y)
+            self.mmb_pitch0 = float(getattr(self.scenes[si].rois[ri], "axis_elev_deg", 0.0))
+
         def on_middle_drag(self, x, y, mods):
-            pass
-            # if not getattr(self, "mmb_drag", False): return
-            # cx, cy = self._to_content(x, y)
-            # si = self.active_scene
-            # if si < 0 or not self.scenes[si].rois: return
-            # ri = self.find_roi_at(si, cx, cy)
-            # if ri < 0: ri = self.active_roi
-            # r = self.scenes[si].rois[ri]
-            # # yaw from drag vector
-            # dx = cx - (r.rect[0] + r.rect[2]//2); dy = cy - (r.rect[1] + r.rect[3]//2)
-            # yaw = (math.degrees(math.atan2(dy, dx)) % 360.0)
-            # r.io_dir_deg = yaw; r.dir_gate_deg = yaw; r.dir_io_deg = yaw if math.isnan(getattr(r,'dir_io_deg',float('nan'))) else r.dir_io_deg
-            # # pitch when Shift held: up = +pitch
-            # if mods & QtCore.Qt.ShiftModifier:
-            #     r.axis_elev_deg = float(np.clip(getattr(r, "axis_elev_deg", 0.0) - 0.25*dy, -89.0, 89.0))
-            # self.scenes[si].rois[ri] = r
-        def on_middle_up(self): self.mmb_drag = False
+            if not getattr(self, "mmb_drag", False):
+                return
+            si = self.active_scene
+            ri = int(getattr(self, "mmb_roi", -1))
+            if si < 0 or ri < 0 or ri >= len(self.scenes[si].rois):
+                return
+            _, ay = getattr(self, "mmb_anchor", self._to_content(x, y))
+            cx, cy = self._to_content(x, y)
+            dy = float(cy - ay)
+            r = self.scenes[si].rois[ri]
+            pitch0 = float(getattr(self, "mmb_pitch0", getattr(r, "axis_elev_deg", 0.0)))
+            r.axis_elev_deg = float(np.clip(pitch0 - 0.40 * dy, -89.0, 89.0))
+            self.scenes[si].rois[ri] = r
+            try:
+                self.view.update()
+            except Exception:
+                pass
+
+        def on_middle_up(self):
+            self.mmb_drag = False
+            self.mmb_roi = -1
 
 
         def on_left_down(self, x, y, shift, alt, ctrl):
@@ -13586,45 +13862,90 @@ def run_qt(video_path):
                     r = self.scenes[si].rois[ri]
                     if getattr(r, "dir_hit", None):
                         x0,y0,w0,h0 = r.dir_hit
-                        if x0 <= cx <= x0+w0 and y0 <= cy <= y0+h0:
-                            # compute quantized direction from widget center
-                            ccx = x0 + w0//2; ccy = y0 + h0//2
-                            deg = _quantize8_deg_from_xy(cx - ccx, cy - ccy)
-                            if bool(shift):
-                                r.dir_io_deg = deg
-                            else:
-                                r.dir_gate_deg = deg
-                                if math.isnan(getattr(r,'dir_io_deg',float('nan'))):  # default io to gate
-                                    r.dir_io_deg = deg
-                            self.scenes[si].rois[ri] = r
+                        if x0 <= cx <= x0+w0 and y0 <= cy <= y0+h0 and not alt:
+                            self._push_undo("Set AOI", coalesce="roi_aoi")
+                            self.dragging = False
+                            self.active_roi = ri
+                            self.aoi_drag = True
+                            self.aoi_drag_roi = ri
+                            self._set_roi_aoi_from_point(si, ri, cx, cy)
+                            try:
+                                self.view.update()
+                            except Exception:
+                                pass
                             return
 
 
-        # Controller.on_right_click(self, x, y)  -- replace with:
-        def on_right_click(self, x, y):
-            cx, cy = self._to_content(x,y)
+        def _begin_rename_roi(self, si: int, ri: int):
+            if si < 0 or si >= len(self.scenes):
+                return
+            if ri < 0 or ri >= len(self.scenes[si].rois):
+                return
+            self.active_scene = si
+            self.active_roi = ri
+            self.naming_roi = ri
+            self.name_buf = self.scenes[si].rois[ri].name or ""
+            try:
+                self.view.update()
+            except Exception:
+                pass
+
+        def on_right_click(self, x, y, mods=None):
+            cx, cy = self._to_content(x, y)
             si = self.active_scene
-            if si < 0: return
-            # If right-click is on any ROI's 8-way widget → toggle expansion
-            for ri, r in enumerate(self.scenes[si].rois):
-                hb = getattr(r, "dir8_hit", None)
-                if hb:
-                    x0,y0,w,h = hb
-                    if x0 <= cx <= x0+w and y0 <= cy <= y0+h:
-                        r.dir8_expanded = not getattr(r, "dir8_expanded", False)
-                        self.scenes[si].rois[ri] = r
-                        return
-            # otherwise keep your existing postview behavior
+            if si < 0:
+                return
+
+            mods = mods or QtCore.Qt.NoModifier
+            ctrl = bool(mods & QtCore.Qt.ControlModifier)
+            alt = bool(mods & QtCore.Qt.AltModifier)
+
+            # Alt+Right-click on the 8-way widget keeps the old expand/collapse behavior.
+            if alt:
+                for ri, r in enumerate(self.scenes[si].rois):
+                    hb = getattr(r, "dir8_hit", None)
+                    if hb:
+                        x0, y0, w0, h0 = hb
+                        if x0 <= cx <= x0 + w0 and y0 <= cy <= y0 + h0:
+                            r.dir8_expanded = not getattr(r, "dir8_expanded", False)
+                            self.scenes[si].rois[ri] = r
+                            return
+
+            # Right-click on the ROI panel row = rename immediately.
+            for ri, (x0, y0, x1, y1) in self.roi_panel_hitboxes:
+                if x0 <= cx <= x1 and y0 <= cy <= y1:
+                    self._begin_rename_roi(si, ri)
+                    return
+
             ri = self.find_roi_at(si, cx, cy)
-            if ri < 0: return
-            self.postview_active = True
-            self.postview_roi = (si, ri)
-            self._postview_saved_idx = self.frame_idx
-            self.playing = False
+            if ri < 0:
+                return
+
+            self.active_roi = ri
+            if ctrl:
+                # Keep postview available, but move it behind Ctrl+Right-click.
+                self.postview_active = True
+                self.postview_roi = (si, ri)
+                self._postview_saved_idx = self.frame_idx
+                self.playing = False
+                return
+
+            self._begin_rename_roi(si, ri)
 
 
         def on_move(self, x, y):
             cx, cy = self._to_content(x,y)
+            if getattr(self, "aoi_drag", False):
+                si = self.active_scene
+                ri = int(getattr(self, "aoi_drag_roi", -1))
+                if si >= 0 and ri >= 0 and ri < len(self.scenes[si].rois):
+                    self._set_roi_aoi_from_point(si, ri, cx, cy)
+                    try:
+                        self.view.update()
+                    except Exception:
+                        pass
+                return
+
             if self.dragging_timeline:
                 idx = int(np.clip((cx / max(1, self.W-1)) * (self.N-1), 0, self.N-1))
                 if idx != self.frame_idx:
@@ -13649,6 +13970,12 @@ def run_qt(video_path):
 
 
         def on_left_up(self, x, y):
+            if getattr(self, "aoi_drag", False):
+                self.aoi_drag = False
+                self.aoi_drag_roi = -1
+                self.dragging = False
+                return
+
             if self.dragging_timeline:
                 self.dragging_timeline = False
                 return
@@ -13733,8 +14060,7 @@ def run_qt(video_path):
             cx, cy = self._to_content(x,y)
             ri = self.find_roi_at(self.active_scene, cx, cy)
             if ri >= 0:
-                self.naming_roi = ri
-                self.name_buf = self.scenes[self.active_scene].rois[ri].name or ""
+                self._begin_rename_roi(self.active_scene, ri)
 
         def on_wheel(self, x, y, delta, ctrl, shift):
             cx, cy = self._to_content(x,y)
@@ -13788,23 +14114,21 @@ def run_qt(video_path):
                         
             si = self.active_scene
             if si >= 0 and self.scenes[si].rois:
-                for ri, r in enumerate(self.scenes[si].rois):
-                    if getattr(r, "dir_hit", None):
-                        x0,y0,w0,h0 = r.dir_hit
-                        if x0 <= cx <= x0+w0 and y0 <= cy <= y0+h0:
-                            self._push_undo("Rotate ROI direction", coalesce="roi_param")
-                            step = (45 if steps>0 else -45)
-                            if bool(ctrl): step *= 2  # faster
-                            if bool(shift):
-                                base = r.dir_io_deg if not math.isnan(getattr(r,'dir_io_deg',float('nan'))) else r.dir_gate_deg
-                                if not math.isnan(base): r.dir_io_deg = (base + step) % 360.0
-                            else:
-                                base = r.dir_gate_deg if not math.isnan(getattr(r,'dir_gate_deg',float('nan'))) else 0.0
-                                r.dir_gate_deg = (base + step) % 360.0
-                                if math.isnan(getattr(r,'dir_io_deg',float('nan'))):
-                                    r.dir_io_deg = r.dir_gate_deg
-                            self.scenes[si].rois[ri] = r
-                            return
+                ri = self.find_roi_at(si, cx, cy)
+                if ri < 0:
+                    for rj, r in enumerate(self.scenes[si].rois):
+                        hb = getattr(r, "dir_hit", None)
+                        if hb:
+                            x0, y0, w0, h0 = hb
+                            if x0 <= cx <= x0 + w0 and y0 <= cy <= y0 + h0:
+                                ri = rj
+                                break
+                if ri >= 0:
+                    self._push_undo("Adjust AOI lean", coalesce="roi_aoi")
+                    r = self.scenes[si].rois[ri]
+                    r.axis_elev_deg = float(np.clip(getattr(r, "axis_elev_deg", 0.0) + 4.0 * steps, -89.0, +89.0))
+                    self.scenes[si].rois[ri] = r
+                    return
 
             return  # scroll elsewhere → no action
 
@@ -14588,11 +14912,13 @@ def run_qt(video_path):
 
             # plots
             self.plot_flux = _Sparkline("Flux (0..1)", 0.0, 1.0)
-            self.plot_axis = _Sparkline("AoI v (−1..+1)", -1.0, 1.0)
-            self.plot_lat  = _Sparkline("Lateral amp (0..1)", 0.0, 1.0)
+            self.plot_axis = _Sparkline("AoI thrust v (−1..+1)", -1.0, 1.0)
+            self.plot_lat  = _Sparkline("Depth sway / Z amp (0..1)", 0.0, 1.0)
+            self.plot_raise = _Sparkline("Raise / Y amp (0..1)", 0.0, 1.0)
             left.addWidget(self.plot_flux, 2)
             left.addWidget(self.plot_axis, 2)
             left.addWidget(self.plot_lat,  2)
+            left.addWidget(self.plot_raise, 2)
 
             # RIGHT: marker table + tools
             right = QtWidgets.QVBoxLayout()
@@ -15195,14 +15521,17 @@ def run_qt(video_path):
             vx = self._fit_len(vx)
             vy = self._fit_len(vy)
             vz = self._fit_len(vz)
+
             flags = None
             if getattr(self.sc, "dup_flags", None) and len(self.sc.dup_flags) == self.T:
                 flags = np.asarray(self.sc.dup_flags, bool)
 
-            low = getattr(self.sc, "roi_lowconf", {}).get(int(ri), [])
-            if low and len(low) == self.T:
-                low = np.asarray(low, bool)
-                flags = low if flags is None else (flags | low)
+            low_raw = getattr(self.sc, "roi_lowconf", {}).get(int(ri), [])
+            if low_raw and len(low_raw) == self.T:
+                lowb = np.asarray(low_raw, bool)
+                flags = lowb if flags is None else (flags | lowb)
+            else:
+                lowb = _fit_series_len([], self.T, fill=False, dtype=bool)
 
             stutter = infer_stutter_flags(vx, vy, vz)
             if np.any(stutter):
@@ -15220,38 +15549,20 @@ def run_qt(video_path):
 
             r = self.sc.rois[ri]
             fps = float(self.fps)
+            curv = _fit_series_len(getattr(self.sc, "roi_curv", {}).get(int(ri), []), self.T, fill=0.0, dtype=np.float64)
+            igdE = _fit_series_len(getattr(self.sc, "roi_igdE", {}).get(int(ri), []), self.T, fill=0.0, dtype=np.float64)
+            lowconf = _fit_series_len(low_raw, self.T, fill=False, dtype=bool)
 
-            # Axis params (same as your existing preview)
-            yaw  = float(getattr(r, "io_dir_deg", getattr(r, "dir_gate_deg", 0.0)) or 0.0)
-            elev = float(getattr(r, "axis_elev_deg", 0.0) or 0.0)
-            kz   = float(getattr(r, "axis_z_scale", 1.0) or 1.0)
-            ax_u, ay_u, az_u = _axis_unit3d(yaw, elev)
-
-            vx3 = vx_s
-            vy3 = vy_s
-            vz3 = kz * vz_s
-
-            vmag = np.sqrt(vx3*vx3 + vy3*vy3 + vz3*vz3) + 1e-12
-            v_al = vx3*ax_u + vy3*ay_u + vz3*az_u
-            axis_v = normalize_signed11(v_al)
-
-            # lateral as AoI yaw+90 (unchanged)
-            lx_u, ly_u, lz_u = _axis_unit3d(yaw + 90.0, elev)
-            v_lat_signed = vx3*lx_u + vy3*ly_u + vz3*lz_u
-            cos_lat = np.abs(v_lat_signed / vmag)
-            lat_half = float(getattr(r, "lat_half_deg", 30.0))
-            lat_pow  = float(getattr(r, "lat_power", 4.0))
-            if 0.0 < lat_half < 90.0:
-                cos_min = math.cos(math.radians(lat_half))
-                w_lat = np.zeros_like(cos_lat)
-                mask = cos_lat >= cos_min
-                if np.any(mask):
-                    w_lat[mask] = ((cos_lat[mask] - cos_min) /
-                                   max(1e-6, 1.0 - cos_min)) ** lat_pow
-            else:
-                w_lat = cos_lat ** lat_pow
-            v_lat_w = v_lat_signed * w_lat
-            lat_amp = normalize_unsigned01(np.abs(v_lat_w))
+            kin = _semantic_motion_lanes(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
+            v_al = kin["v_al"]
+            axis_v = kin["axis_v11"]
+            lat_amp = kin["lat_amp01"]
+            raise_amp = kin["raise_amp01"]
 
             # ---------------- FLUX: compute like exporter ----------------
             # Choose principal component for cycle semantics (same rule as exporter)
@@ -15315,7 +15626,7 @@ def run_qt(video_path):
                 base = np.clip((1.0 - mix) * flux_measured_final + mix * pretty, 0.0, 1.0)
                 flux_final = np.clip((1.0 - bleed) * base + bleed * flux_measured_final, 0.0, 1.0)
 
-            return {"flux": flux_final, "axis_v": axis_v, "lat_amp": lat_amp, "vx": vx, "vy": vy, "vz": vz}
+            return {"flux": flux_final, "axis_v": axis_v, "lat_amp": lat_amp, "raise_amp": raise_amp, "vx": vx, "vy": vy, "vz": vz}
 
 
         def _compute_corrected_preview(self, ri: int, base: Dict[str, np.ndarray], markers):
@@ -15391,6 +15702,7 @@ def run_qt(video_path):
             flux_curves = [base["flux"]]
             axis_curves = [base["axis_v"]]
             lat_curves  = [base["lat_amp"]]
+            raise_curves = [base["raise_amp"]]
 
             show_flux_corr = bool(self.chk_hard.isChecked()) or bool(self.chk_apply.isChecked())
             show_vec_corr  = bool(self.chk_apply.isChecked())
@@ -15400,10 +15712,12 @@ def run_qt(video_path):
             if show_vec_corr:
                 axis_curves.append(corr["axis_v"])
                 lat_curves.append(corr["lat_amp"])
+                raise_curves.append(corr["raise_amp"])
 
             self.plot_flux.set_data(flux_curves, ms)
             self.plot_axis.set_data(axis_curves, ms)
             self.plot_lat.set_data(lat_curves, ms)
+            self.plot_raise.set_data(raise_curves, ms)
 
             dirty = bool(self._dirty_by_roi.get(ri, False))
             self.lbl_status.setText(f"markers={len(ms)}  dirty={dirty}  apply={self.chk_apply.isChecked()}")
@@ -15912,7 +16226,7 @@ def run_qt(video_path):
                 )
 
             elif ev.button() == QtCore.Qt.RightButton:
-                self.ctrl.on_right_click(ev.position().x(), ev.position().y()); ev.accept()
+                self.ctrl.on_right_click(ev.position().x(), ev.position().y(), ev.modifiers()); ev.accept()
             elif ev.button() == QtCore.Qt.MiddleButton:
                 self.ctrl.on_middle_down(ev.position().x(), ev.position().y(), ev.modifiers()); ev.accept()
 
