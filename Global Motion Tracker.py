@@ -789,7 +789,11 @@ PROFILES = {
                       conf_min_matches=120, conf_parallax=0.15,
                       gamma=1.15, resample_hz=100.0, flux_z_weight=1.0,
                       sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                      no_bursts=False, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5),
+                      no_bursts=False, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5,
+                      entropy_micro_ms=95.0, entropy_meso_short_ms=260.0, entropy_meso_long_ms=900.0,
+                      entropy_macro_short_ms=1800.0, entropy_macro_long_ms=6500.0,
+                      entropy_micro_jerk_mix=0.30, entropy_macro_z_mix=0.25, entropy_macro_curv_mix=0.20,
+                      activity_global_ms=2200.0, excitement_long_ms=8000.0, entropy_delta_ms=500.0),
     "handheld": dict(smooth_vel="sg", sg_win_ms=220, sg_poly=3,
                      smooth_ang="lp1", lp_ang_hz=4.0, lp_vel_hz=1.2, kalman_q=0.06, kalman_r=0.35,
                      max_rate_vel=0.0, max_rate_ang=0.0, bias_tau_s=6.0,
@@ -797,7 +801,11 @@ PROFILES = {
                      conf_min_matches=100, conf_parallax=0.12,
                      gamma=1.10, resample_hz=120.0, flux_z_weight=1.0,
                      sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                     no_bursts=False, burst_thresh=0.55, burst_ms=110.0, burst_blend=0.55),
+                     no_bursts=False, burst_thresh=0.55, burst_ms=110.0, burst_blend=0.55,
+                     entropy_micro_ms=70.0, entropy_meso_short_ms=180.0, entropy_meso_long_ms=650.0,
+                     entropy_macro_short_ms=1300.0, entropy_macro_long_ms=4500.0,
+                     entropy_micro_jerk_mix=0.35, entropy_macro_z_mix=0.20, entropy_macro_curv_mix=0.15,
+                     activity_global_ms=1700.0, excitement_long_ms=6200.0, entropy_delta_ms=360.0),
     "action": dict(smooth_vel="sg", sg_win_ms=180, sg_poly=3,
                    smooth_ang="lp1", lp_ang_hz=5.0, lp_vel_hz=1.5, kalman_q=0.08, kalman_r=0.4,
                    max_rate_vel=0.0, max_rate_ang=0.0, bias_tau_s=4.0,
@@ -805,7 +813,11 @@ PROFILES = {
                    conf_min_matches=90, conf_parallax=0.10,
                    gamma=1.10, resample_hz=150.0, flux_z_weight=1.2,
                    sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                   no_bursts=False, burst_thresh=0.5, burst_ms=100.0, burst_blend=0.6),
+                   no_bursts=False, burst_thresh=0.5, burst_ms=100.0, burst_blend=0.6,
+                   entropy_micro_ms=55.0, entropy_meso_short_ms=140.0, entropy_meso_long_ms=500.0,
+                   entropy_macro_short_ms=1000.0, entropy_macro_long_ms=3500.0,
+                   entropy_micro_jerk_mix=0.45, entropy_macro_z_mix=0.20, entropy_macro_curv_mix=0.10,
+                   activity_global_ms=1200.0, excitement_long_ms=4500.0, entropy_delta_ms=260.0),
     "stabilized": dict(smooth_vel="sg", sg_win_ms=360, sg_poly=3,
                        smooth_ang="lp1", lp_ang_hz=2.0, lp_vel_hz=0.8, kalman_q=0.04, kalman_r=0.3,
                        max_rate_vel=0.0, max_rate_ang=0.0, bias_tau_s=12.0,
@@ -813,7 +825,11 @@ PROFILES = {
                        conf_min_matches=140, conf_parallax=0.18,
                        gamma=1.20, resample_hz=80.0, flux_z_weight=0.8,
                        sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                       no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5),
+                       no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5,
+                       entropy_micro_ms=120.0, entropy_meso_short_ms=320.0, entropy_meso_long_ms=1100.0,
+                       entropy_macro_short_ms=2200.0, entropy_macro_long_ms=8000.0,
+                       entropy_micro_jerk_mix=0.25, entropy_macro_z_mix=0.25, entropy_macro_curv_mix=0.20,
+                       activity_global_ms=2600.0, excitement_long_ms=9000.0, entropy_delta_ms=650.0),
     "vr_comfort": dict(smooth_vel="sg", sg_win_ms=320, sg_poly=3,
                        smooth_ang="lp1", lp_ang_hz=2.5, lp_vel_hz=1.0, kalman_q=0.05, kalman_r=0.3,
                        max_rate_vel=0.0, max_rate_ang=0.0, bias_tau_s=10.0,
@@ -821,7 +837,11 @@ PROFILES = {
                        conf_min_matches=130, conf_parallax=0.16,
                        gamma=1.20, resample_hz=100.0, flux_z_weight=1.0,
                        sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                       no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5),
+                       no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5,
+                       entropy_micro_ms=110.0, entropy_meso_short_ms=280.0, entropy_meso_long_ms=1000.0,
+                       entropy_macro_short_ms=2000.0, entropy_macro_long_ms=7000.0,
+                       entropy_micro_jerk_mix=0.20, entropy_macro_z_mix=0.30, entropy_macro_curv_mix=0.20,
+                       activity_global_ms=2400.0, excitement_long_ms=8500.0, entropy_delta_ms=600.0),
     "raw": dict(smooth_vel="lp1", lp_vel_hz=6.0, sg_win_ms=150, sg_poly=3,
                 smooth_ang="lp1", lp_ang_hz=8.0, kalman_q=0.10, kalman_r=0.5,
                 max_rate_vel=0.0, max_rate_ang=0.0, bias_tau_s=2.0,
@@ -829,7 +849,11 @@ PROFILES = {
                 conf_min_matches=60, conf_parallax=0.06,
                 gamma=1.00, resample_hz=150.0, flux_z_weight=1.0,
                 sign_vx="auto", sign_vy="auto", sign_vz="auto", sign_wyaw="auto", sign_wpitch="auto", sign_wroll="auto",
-                no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5),
+                no_bursts=True, burst_thresh=0.6, burst_ms=120.0, burst_blend=0.5,
+                entropy_micro_ms=45.0, entropy_meso_short_ms=120.0, entropy_meso_long_ms=400.0,
+                entropy_macro_short_ms=900.0, entropy_macro_long_ms=3000.0,
+                entropy_micro_jerk_mix=0.40, entropy_macro_z_mix=0.20, entropy_macro_curv_mix=0.15,
+                activity_global_ms=950.0, excitement_long_ms=3500.0, entropy_delta_ms=220.0),
 }
 
 
@@ -1306,6 +1330,199 @@ def log1d_series(x, fps, sigma_ms=80.0):
     d1 = np.gradient(x_blur, dt, edge_order=2)
     d2 = np.gradient(d1,      dt, edge_order=2)
     return d2
+
+
+def _ms_to_sigma_frames(ms: float, fps: float, minimum: float = 1.0) -> float:
+    return max(float(minimum), (float(ms) / 1000.0) * float(fps))
+
+
+def _robust_mag01(x: np.ndarray, pct: float = 95.0) -> np.ndarray:
+    x = np.asarray(x, np.float64)
+    if x.size == 0:
+        return x
+    mag = np.abs(x)
+    scale = float(np.percentile(mag, pct)) or 1e-9
+    return np.clip(mag / scale, 0.0, 1.0)
+
+
+def _trimmed_mean(x: np.ndarray, lo: float = 10.0, hi: float = 90.0) -> float:
+    x = np.asarray(x, np.float64)
+    if x.size == 0:
+        return 0.0
+    lo_v, hi_v = np.percentile(x, [lo, hi])
+    keep = x[(x >= lo_v) & (x <= hi_v)]
+    if keep.size == 0:
+        keep = x
+    return float(np.mean(keep))
+
+
+def compute_long_horizon_motion_lanes(flux, flux_n, entropy_micro01, entropy_meso01, entropy_macro01, fps, args):
+    """
+    Long-horizon motion lanes beyond the local entropy stack.
+
+    global activity : local scene motion vs full-clip baseline (not entropy)
+    entropy delta   : rate of change of combined entropy state
+    excitement long : very slow running average of clip-normalized flux
+    """
+    flux = np.asarray(flux, np.float64)
+    flux_n = np.asarray(flux_n, np.float64)
+    entropy_micro01 = np.asarray(entropy_micro01, np.float64)
+    entropy_meso01 = np.asarray(entropy_meso01, np.float64)
+    entropy_macro01 = np.asarray(entropy_macro01, np.float64)
+
+    zeros = np.zeros_like(flux, dtype=np.float64)
+    if flux.size == 0:
+        return dict(
+            activity_global01=zeros,
+            activity_global_signed=zeros,
+            activity_global_ratio=zeros,
+            entropy_total01=zeros,
+            entropy_delta01=zeros,
+            entropy_delta_signed=zeros,
+            excitement_long01=zeros,
+            flux_global_baseline=0.0,
+        )
+
+    activity_sigma = _ms_to_sigma_frames(getattr(args, "activity_global_ms", 1800.0), fps)
+    excitement_sigma = _ms_to_sigma_frames(getattr(args, "excitement_long_ms", 6000.0), fps)
+    entropy_delta_sigma = _ms_to_sigma_frames(getattr(args, "entropy_delta_ms", 400.0), fps)
+
+    # 1) Full-clip baseline comparison: scene-local flux against robust whole-clip average.
+    scene_flux = gauss_blur1d(flux, activity_sigma)
+    flux_global_baseline = max(1e-9, _trimmed_mean(scene_flux, 10.0, 90.0))
+    activity_log_ratio = np.log((scene_flux + 1e-9) / flux_global_baseline)
+    activity_scale = float(np.percentile(np.abs(activity_log_ratio), 90.0)) or 1e-9
+    activity_global_signed = np.tanh(0.85 * (activity_log_ratio / activity_scale))
+    activity_global01 = np.clip(0.5 + 0.5 * activity_global_signed, 0.0, 1.0)
+    activity_global_ratio = np.clip(np.exp(activity_log_ratio), 0.0, 16.0)
+
+    # 2) Change in entropy: derivative of a smoothed composite surprise state.
+    #    Weight meso/macro more than micro so this tracks state transitions, not texture fizz.
+    entropy_total01 = np.clip(
+        0.20 * entropy_micro01 +
+        0.35 * entropy_meso01 +
+        0.45 * entropy_macro01,
+        0.0, 1.0
+    )
+    entropy_state = gauss_blur1d(entropy_total01, entropy_delta_sigma)
+    if entropy_state.size >= 3:
+        dt = 1.0 / max(1e-6, float(fps))
+        entropy_delta = np.gradient(entropy_state, dt, edge_order=2)
+    else:
+        entropy_delta = zeros
+    entropy_delta_signed = np.tanh(0.80 * robust_z(entropy_delta, clip=4.0))
+    entropy_delta01 = _robust_mag01(entropy_delta_signed)
+
+    # 3) Very slow excitement driver: clip-normalized flux averaged over long windows.
+    excitement_long01 = np.clip(gauss_blur1d(flux_n, excitement_sigma), 0.0, 1.0)
+
+    return dict(
+        activity_global01=activity_global01,
+        activity_global_signed=activity_global_signed,
+        activity_global_ratio=activity_global_ratio,
+        entropy_total01=entropy_total01,
+        entropy_delta01=entropy_delta01,
+        entropy_delta_signed=entropy_delta_signed,
+        excitement_long01=excitement_long01,
+        flux_global_baseline=flux_global_baseline,
+    )
+
+
+def compute_multiscale_entropy_lanes(flux, acc, jerk, vz_s, divz_s, curv_series, fps, args):
+    """
+    Multi-scale global motion entropy.
+
+    micro: fast residual unpredictability / jitter (flux HP + jerk bursts)
+    meso : short-vs-mid disagreement / pattern breaks
+    macro: slower structural drift with depth and curvature participation
+
+    Returns signed cores (-1..1-ish after tanh) and normalized magnitudes (0..1).
+    """
+    flux = np.asarray(flux, np.float64)
+    acc = np.asarray(acc, np.float64)
+    jerk = np.asarray(jerk, np.float64)
+    vz_s = np.asarray(vz_s, np.float64)
+    divz_s = np.asarray(divz_s, np.float64)
+    curv_series = np.asarray(curv_series, np.float64)
+
+    zeros = np.zeros_like(flux, dtype=np.float64)
+    if flux.size == 0:
+        return dict(
+            micro_core=zeros, meso_core=zeros, macro_core=zeros,
+            entropy_micro01=zeros, entropy_meso01=zeros, entropy_macro01=zeros,
+        )
+
+    micro_sigma = _ms_to_sigma_frames(getattr(args, "entropy_micro_ms", 90.0), fps)
+    meso_short_sigma = _ms_to_sigma_frames(getattr(args, "entropy_meso_short_ms", 220.0), fps)
+    meso_long_sigma = _ms_to_sigma_frames(getattr(args, "entropy_meso_long_ms", 750.0), fps)
+    macro_short_sigma = _ms_to_sigma_frames(getattr(args, "entropy_macro_short_ms", 1800.0), fps)
+    macro_long_sigma = _ms_to_sigma_frames(getattr(args, "entropy_macro_long_ms", 6000.0), fps)
+
+    # keep scales ordered even if a profile is misconfigured
+    meso_short_sigma = max(micro_sigma + 1.0, meso_short_sigma)
+    meso_long_sigma = max(meso_short_sigma + 1.0, meso_long_sigma)
+    macro_short_sigma = max(meso_long_sigma + 1.0, macro_short_sigma)
+    macro_long_sigma = max(macro_short_sigma + 1.0, macro_long_sigma)
+
+    micro_jerk_mix = float(np.clip(getattr(args, "entropy_micro_jerk_mix", 0.35), 0.0, 1.0))
+    macro_z_mix = float(np.clip(getattr(args, "entropy_macro_z_mix", 0.25), 0.0, 1.0))
+    macro_curv_mix = float(np.clip(getattr(args, "entropy_macro_curv_mix", 0.20), 0.0, 1.0))
+    macro_flux_mix = max(0.0, 1.0 - macro_z_mix - macro_curv_mix)
+    wsum = macro_flux_mix + macro_z_mix + macro_curv_mix
+    if wsum <= 1e-9:
+        macro_flux_mix, macro_z_mix, macro_curv_mix = 1.0, 0.0, 0.0
+    else:
+        macro_flux_mix /= wsum
+        macro_z_mix /= wsum
+        macro_curv_mix /= wsum
+
+    # micro: fast residual + jerk spikes
+    flux_fast = gauss_blur1d(flux, micro_sigma)
+    flux_hp = flux - flux_fast
+    micro_drive = ((1.0 - micro_jerk_mix) * robust_z(flux_hp, clip=4.0) +
+                   micro_jerk_mix * robust_z(jerk, clip=4.0))
+    micro_core = np.tanh(0.70 * micro_drive)
+    entropy_micro01 = _robust_mag01(micro_core)
+
+    # meso: pattern-break disagreement between shorter and longer local expectations
+    flux_short = gauss_blur1d(flux, meso_short_sigma)
+    flux_mid = gauss_blur1d(flux, meso_long_sigma)
+    meso_delta = flux_short - flux_mid
+    acc_mid = gauss_blur1d(acc, meso_short_sigma) if acc.size else zeros
+    meso_drive = 0.85 * robust_z(meso_delta, clip=4.0) + 0.15 * robust_z(acc_mid, clip=4.0)
+    meso_core = np.tanh(0.75 * meso_drive)
+    entropy_meso01 = _robust_mag01(meso_core)
+
+    # macro: slower structural drift with depth/curvature participation
+    flux_macro = gauss_blur1d(flux, macro_short_sigma) - gauss_blur1d(flux, macro_long_sigma)
+
+    z_macro = gauss_blur1d(vz_s, macro_short_sigma) - gauss_blur1d(vz_s, macro_long_sigma)
+    if divz_s.size == flux.size:
+        z_macro = 0.75 * z_macro + 0.25 * (
+            gauss_blur1d(divz_s, macro_short_sigma) - gauss_blur1d(divz_s, macro_long_sigma)
+        )
+
+    if curv_series.size == flux.size:
+        curv_macro = gauss_blur1d(curv_series, macro_short_sigma) - gauss_blur1d(curv_series, macro_long_sigma)
+    else:
+        curv_macro = zeros
+
+    macro_drive = (
+        macro_flux_mix * robust_z(flux_macro, clip=4.0) +
+        macro_z_mix * robust_z(z_macro, clip=4.0) +
+        macro_curv_mix * robust_z(curv_macro, clip=4.0)
+    )
+    macro_core = np.tanh(0.80 * macro_drive)
+    entropy_macro01 = _robust_mag01(macro_core)
+
+    return dict(
+        micro_core=micro_core,
+        meso_core=meso_core,
+        macro_core=macro_core,
+        entropy_micro01=entropy_micro01,
+        entropy_meso01=entropy_meso01,
+        entropy_macro01=entropy_macro01,
+    )
 
 
 def savgol_coeffs(window: int, poly: int):
@@ -2379,28 +2596,26 @@ class Analyzer:
         flux    = np.sqrt(vx_s**2 + vy_s**2 + (args.flux_z_weight * vz_s)**2)
         acc  = np.gradient(flux, t, edge_order=2) if t.size >= 3 else np.zeros_like(flux)
         jerk = np.gradient(acc,  t, edge_order=2) if t.size >= 3 else np.zeros_like(acc)
-        # --- Primary motion-based entropy from global flux ---
+        # --- Multi-scale motion entropy: micro / meso / macro ---
+        ent = compute_multiscale_entropy_lanes(
+            flux=flux,
+            acc=acc,
+            jerk=jerk,
+            vz_s=vz_s,
+            divz_s=vz_div_raw,
+            curv_series=curv_series,
+            fps=fps,
+            args=args,
+        )
+        micro_core = ent["micro_core"]
+        meso_core = ent["meso_core"]
+        macro_core = ent["macro_core"]
+        entropy_micro01 = ent["entropy_micro01"]
+        entropy_meso01 = ent["entropy_meso01"]
+        entropy_macro01 = ent["entropy_macro01"]
 
-        # Event entropy: deviation from a slow trend (~0.35 s)
-        sigma_event = max(1.0, 0.35 * fps)
-        flux_slow   = gauss_blur1d(flux, sigma_event)
-        flux_res    = flux - flux_slow
-
-        ent_event   = np.abs(flux_res)
-        p95_event   = float(np.percentile(ent_event, 95.0)) or 1e-9
-        entropy_event01 = np.clip(ent_event / p95_event, 0.0, 1.0)
-
-        # Micro entropy: fast, noisy residual (~0.10 s), MAD-whitened
-        sigma_micro = max(1.0, 0.10 * fps)
-        flux_fast   = gauss_blur1d(flux, sigma_micro)
-        flux_hp     = flux - flux_fast
-
-        z_hp        = robust_z(flux_hp, clip=4.0)
-        micro_core  = np.tanh(0.7 * z_hp)   # signed, compressed chaos
-        ent_micro   = np.abs(micro_core)
-
-        p95_micro   = float(np.percentile(ent_micro, 95.0)) or 1e-9
-        entropy_micro01 = np.clip(ent_micro / p95_micro, 0.0, 1.0)
+        # legacy aliases: preserve existing exports
+        entropy_event01 = entropy_meso01
 
         # --- Secondary: smoothed LoG² entropy from curvature (G(LoG(LoG(curv)))) ---
 
@@ -2464,6 +2679,26 @@ class Analyzer:
         p_lo_val = np.percentile(flux, args.p_lo); p_hi_val = np.percentile(flux, args.p_hi)
         denom = max(1e-9, (p_hi_val - p_lo_val))
         flux_n = np.clip((flux - p_lo_val) / denom, 0.0, 1.0) ** args.gamma
+
+        # --- Long-horizon motion state: full-clip baseline / entropy change / slow excitement ---
+        longh = compute_long_horizon_motion_lanes(
+            flux=flux,
+            flux_n=flux_n,
+            entropy_micro01=entropy_micro01,
+            entropy_meso01=entropy_meso01,
+            entropy_macro01=entropy_macro01,
+            fps=fps,
+            args=args,
+        )
+        activity_global01 = longh["activity_global01"]
+        activity_global_signed = longh["activity_global_signed"]
+        activity_global_ratio = longh["activity_global_ratio"]
+        entropy_total01 = longh["entropy_total01"]
+        entropy_delta01 = longh["entropy_delta01"]
+        entropy_delta_signed = longh["entropy_delta_signed"]
+        excitement_long01 = longh["excitement_long01"]
+        flux_global_baseline = float(longh["flux_global_baseline"])
+
         acc_n  = self.norm_sym_p95(acc, args.gamma)
 
         out_cols = {
@@ -2494,12 +2729,30 @@ class Analyzer:
             "fm_high_hz": rs(3.0 + 15.0 * flux_n),
 
             # Entropy lanes
-            "cam_entropy_event01":  rs(entropy_event01),   # macro motion-change spikes
-            "cam_entropy_motion01": rs(entropy_micro01),   # primary motion micro-chaos
-            "cam_entropy_log2_01":  rs(entropy_log2_01),   # smoothed LoG² curvature entropy
+            "cam_entropy_event01":  rs(entropy_event01),   # legacy alias: meso pattern-break entropy
+            "cam_entropy_motion01": rs(entropy_micro01),   # legacy alias: micro jitter entropy
+            "cam_entropy_log2_01":  rs(entropy_log2_01),   # legacy curvature / artifact entropy
             "cam_log2_signed":      rs(np.clip(log2_core, -1.0, 1.0)),
-            "entropy_flux01": rs(entropy_micro01),  # default: motion-based micro entropy
+            "entropy_flux01": rs(entropy_micro01),         # default: micro entropy
 
+            # New multi-scale entropy lanes
+            "cam_entropy_micro01": rs(entropy_micro01),
+            "cam_entropy_meso01":  rs(entropy_meso01),
+            "cam_entropy_macro01": rs(entropy_macro01),
+            "cam_entropy_micro_signed": rs(np.clip(micro_core, -1.0, 1.0)),
+            "cam_entropy_meso_signed":  rs(np.clip(meso_core, -1.0, 1.0)),
+            "cam_entropy_macro_signed": rs(np.clip(macro_core, -1.0, 1.0)),
+            "cam_entropy_curv01": rs(entropy_log2_01),
+
+            # Long-horizon motion state
+            "cam_activity_global01": rs(activity_global01),
+            "cam_activity_global_signed": rs(np.clip(activity_global_signed, -1.0, 1.0)),
+            "cam_activity_global_ratio": rs(activity_global_ratio),
+            "cam_entropy_total01": rs(entropy_total01),
+            "cam_entropy_delta01": rs(entropy_delta01),
+            "cam_entropy_delta_signed": rs(np.clip(entropy_delta_signed, -1.0, 1.0)),
+            "cam_excitement_long01": rs(excitement_long01),
+            "cam_flux_global_baseline": np.full_like(t_out, flux_global_baseline, dtype=np.float64),
 
             # Positions
             "px": rs(px), "py": rs(py), "pz": rs(pz),
