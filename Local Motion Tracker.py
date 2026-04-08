@@ -3913,6 +3913,238 @@ def flux_override_from_markers01(
     return _np.clip(out, 0.0, 1.0)
 
 
+# --- Marker-driven motion coupling (export / preview) -----------------------
+# Problem:
+#   Marker-written Flux previously changed only the loudness lane, while AoI and
+#   related motion envelopes stayed mostly measured. That breaks the natural
+#   coupling you feel in scene-derived data.
+#
+# Solution:
+#   When marker-driven Flux is active, re-inject that Flux back into motion:
+#     - scale the measured carrier by target/measured Flux
+#     - strongly couple the along-axis (AoI) component to the target Flux
+#     - keep a reduced perpendicular residual so secondary envelopes still ripple
+#       instead of going dead-flat
+#
+# This is export/preview only. It does NOT mutate tracked scene state.
+MARKER_MOTION_COUPLE_ENABLE      = True
+MARKER_MOTION_AXIS_MIX           = 0.82   # 0..1, how strongly Flux drives the AoI carrier
+MARKER_MOTION_PERP_BASE          = 0.14   # residual perpendicular floor when Flux is low
+MARKER_MOTION_PERP_FLUX          = 0.52   # extra perpendicular ripple as Flux rises
+MARKER_MOTION_RIPPLE_GAIN        = 0.12   # derivative-driven extra secondary ripple
+MARKER_MOTION_GAIN_MIN           = 0.35   # clamp target/measured Flux scaling
+MARKER_MOTION_GAIN_MAX           = 4.75
+MARKER_MOTION_GAIN_BLUR_SEC      = 0.025  # cosmetic only; keeps scaling stable
+MARKER_MOTION_AXIS_FLOOR01       = 0.06   # tiny floor so manual markers still move when measured Flux is weak
+MARKER_MOTION_ACTIVITY_REF_PCTL  = 95.0   # reference percentile used to synthesize raw AoI motion
+
+
+def _fill_signed_phase_hint(sign_hint, fallback):
+    """
+    Fill zero runs in sign_hint with fallback and nearest non-zero neighbors.
+
+    Returns float array in {-1,+1} when possible.
+    """
+    import numpy as _np
+
+    s = _np.asarray(sign_hint, _np.float64).copy()
+    f = _np.asarray(fallback, _np.float64)
+    if s.size == 0:
+        return s
+
+    if f.size < s.size:
+        if f.size <= 0:
+            f = _np.zeros(s.size, _np.float64)
+        else:
+            f = _np.pad(f, (0, s.size - f.size), mode="edge")
+    elif f.size > s.size:
+        f = f[:s.size]
+
+    s[s == 0.0] = f[s == 0.0]
+
+    last = 0.0
+    for i in range(s.size):
+        if s[i] != 0.0:
+            last = s[i]
+        elif last != 0.0:
+            s[i] = last
+
+    last = 0.0
+    for i in range(s.size - 1, -1, -1):
+        if s[i] != 0.0:
+            last = s[i]
+        elif last != 0.0:
+            s[i] = last
+
+    s = _np.sign(s)
+    s[s == 0.0] = 1.0
+    return s.astype(_np.float64)
+
+
+def couple_motion_to_flux_envelope(
+    vx,
+    vy,
+    vz,
+    flux_measured01,
+    flux_target01,
+    roi: "ROI",
+    fps: float,
+    *,
+    markers=None,
+    force: bool = False,
+    respect_marker_phase_sign: bool = False,
+    axis_mix: float = MARKER_MOTION_AXIS_MIX,
+    perp_base: float = MARKER_MOTION_PERP_BASE,
+    perp_flux: float = MARKER_MOTION_PERP_FLUX,
+    ripple_gain: float = MARKER_MOTION_RIPPLE_GAIN,
+    gain_min: float = MARKER_MOTION_GAIN_MIN,
+    gain_max: float = MARKER_MOTION_GAIN_MAX,
+    gain_blur_sec: float = MARKER_MOTION_GAIN_BLUR_SEC,
+    axis_floor01: float = MARKER_MOTION_AXIS_FLOOR01,
+    ref_pctl: float = MARKER_MOTION_ACTIVITY_REF_PCTL,
+):
+    """
+    Re-couple motion lanes to a marker-driven Flux target.
+
+    Inputs / outputs are px/s-like velocity lanes.
+    We preserve the measured carrier where useful, but force the along-axis
+    magnitude to follow the target Flux much more closely.
+
+    This is intentionally one-way:
+      Flux target -> motion carrier
+    so Hard-write / Override can create convincing motion even if the measured
+    Flux (or measured raw speed) is weak.
+    """
+    import numpy as _np
+
+    vx = _np.asarray(vx if vx is not None else [], _np.float64)
+    vy = _np.asarray(vy if vy is not None else [], _np.float64)
+    vz = _np.asarray(vz if vz is not None else [], _np.float64)
+    T = int(min(vx.size, vy.size, vz.size))
+    if T <= 0:
+        return vx, vy, vz
+
+    vx = vx[:T].copy()
+    vy = vy[:T].copy()
+    vz = vz[:T].copy()
+
+    fm = _np.asarray(flux_measured01 if flux_measured01 is not None else [], _np.float64)
+    ft = _np.asarray(flux_target01 if flux_target01 is not None else [], _np.float64)
+
+    if fm.size < T:
+        fm = _np.pad(fm, (0, T - fm.size), mode="edge") if fm.size else _np.zeros(T, _np.float64)
+    else:
+        fm = fm[:T]
+    if ft.size < T:
+        ft = _np.pad(ft, (0, T - ft.size), mode="edge") if ft.size else _np.zeros(T, _np.float64)
+    else:
+        ft = ft[:T]
+
+    fm = _np.clip(fm, 0.0, 1.0)
+    ft = _np.clip(ft, 0.0, 1.0)
+
+    diff = float(_np.mean(_np.abs(ft - fm))) if T > 0 else 0.0
+    if (not force) and diff < 0.012:
+        return vx, vy, vz
+
+    # 1) Measured-carrier scaling: target/measured Flux, safely clamped.
+    try:
+        fm_floor = max(0.06, float(_np.percentile(fm, 20.0)) * 0.85)
+    except Exception:
+        fm_floor = 0.06
+    gain = ft / _np.maximum(fm, fm_floor)
+    gain = _np.clip(gain, float(gain_min), float(gain_max))
+
+    if gain_blur_sec and float(gain_blur_sec) > 0.0:
+        try:
+            sigma = max(1.0, float(gain_blur_sec) * float(fps))
+            gain = _gauss_blur1d(gain, sigma)
+            gain = _np.clip(gain, float(gain_min), float(gain_max))
+        except Exception:
+            pass
+
+    vx_g = vx * gain
+    vy_g = vy * gain
+    vz_g = vz * gain
+
+    # 2) AoI-aligned carrier in matched 3D units.
+    ax_u, ay_u, az_u = _axis_unit3d(
+        getattr(roi, "io_dir_deg", getattr(roi, "dir_gate_deg", 0.0)),
+        getattr(roi, "axis_elev_deg", 0.0),
+    )
+    kz = float(getattr(roi, "axis_z_scale", 1.0) or 1.0)
+    if abs(kz) < 1e-9:
+        kz = 1.0
+
+    v3x = vx_g
+    v3y = vy_g
+    v3z = kz * vz_g
+    u = _np.asarray([ax_u, ay_u, az_u], _np.float64)
+
+    v_al = (v3x * u[0]) + (v3y * u[1]) + (v3z * u[2])
+    meas_sign = _np.sign(v_al)
+
+    if respect_marker_phase_sign and markers:
+        phase_sign = _phase_sign_from_markers(T, markers).astype(_np.float64)
+        sign_use = _fill_signed_phase_hint(phase_sign, meas_sign)
+    else:
+        sign_use = _fill_signed_phase_hint(meas_sign, meas_sign)
+
+    # Synthetic reference amplitude.
+    speed_g = _np.sqrt(vx_g*vx_g + vy_g*vy_g + vz_g*vz_g)
+    try:
+        ref_axis = float(_np.percentile(_np.abs(v_al), float(ref_pctl)))
+    except Exception:
+        ref_axis = 0.0
+    try:
+        ref_speed = float(_np.percentile(speed_g, float(ref_pctl)))
+    except Exception:
+        ref_speed = 0.0
+
+    # Fallback to a stable synthetic reference so manual markers can still create motion.
+    ref = max(ref_axis, 0.70 * ref_speed, 0.60 * float(REF_SPEED_PPS), 1e-6)
+
+    drive = _np.maximum(ft, float(axis_floor01) * (ft > 0.025))
+    v_al_target = sign_use * drive * ref
+
+    delta = _np.abs(ft - fm)
+    try:
+        dref = float(_np.percentile(delta, 90.0))
+    except Exception:
+        dref = 0.0
+    if (not _np.isfinite(dref)) or dref <= 1e-6:
+        delta_n = _np.clip(delta, 0.0, 1.0)
+    else:
+        delta_n = _np.clip(delta / dref, 0.0, 1.0)
+
+    mix = float(axis_mix) * (0.30 + 0.70 * _np.maximum(drive, delta_n))
+    mix = _np.clip(mix, 0.0, 1.0)
+
+    v_al_new = (1.0 - mix) * v_al + mix * v_al_target
+
+    # 3) Preserve some perpendicular residual so secondary envelopes still breathe.
+    vpx = v3x - (v_al * u[0])
+    vpy = v3y - (v_al * u[1])
+    vpz = v3z - (v_al * u[2])
+
+    try:
+        ripple = _robust01(_np.abs(_deriv_central(ft, 1.0 / max(1e-6, float(fps)))), p_lo=10, p_hi=95)
+    except Exception:
+        ripple = _np.zeros(T, _np.float64)
+
+    perp_gain_arr = float(perp_base) + float(perp_flux) * _np.sqrt(_np.clip(ft, 0.0, 1.0)) + float(ripple_gain) * ripple
+    perp_gain_arr = _np.clip(perp_gain_arr, 0.08, 1.0)
+
+    v3x_new = (vpx * perp_gain_arr) + (v_al_new * u[0])
+    v3y_new = (vpy * perp_gain_arr) + (v_al_new * u[1])
+    v3z_new = (vpz * perp_gain_arr) + (v_al_new * u[2])
+
+    return (
+        _np.asarray(v3x_new, _np.float64),
+        _np.asarray(v3y_new, _np.float64),
+        _np.asarray(v3z_new / kz, _np.float64),
+    )
+
 
 # Goal:
 #   - preserve punchy attacks (instant attack)
@@ -10830,24 +11062,6 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             flux_measured_final = flux_leaky_shape01(flux_measured_final, entropy_roi, fps)
         flux_measured_final = _np.clip(flux_measured_final, 0.0, 1.0)
 
-        acc01 = normalize_unsigned01(_np.sqrt(ax_s*ax_s + ay_s*ay_s + az_s*az_s))
-        jerk01 = normalize_unsigned01(_np.sqrt(jx_s*jx_s + jy_s*jy_s + jz_s*jz_s))
-        curv01 = _robust01(_np.abs(curv), p_lo=5, p_hi=95)
-        ms_lanes = compute_local_multiscale_lanes(
-            flux01=flux_measured_final,
-            entropy01=entropy_roi,
-            jerk01=jerk01,
-            curv01=curv01,
-            speed_abs=speed_s,
-            fps=float(fps),
-        )
-        roi_metric_cache.append(dict(
-            ri=int(ri),
-            labels=list(labels),
-            weight=_roi_scene_weight(r, lowconf),
-            lanes=ms_lanes,
-        ))
-
         # Default output (no hard write): measured final
         flux_inner = flux_measured_final
 
@@ -10920,7 +11134,91 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             flux_inner = _np.clip((1.0 - override_mix) * flux_inner + override_mix * flux_override, 0.0, 1.0)
         # --- END FLUX_SHAPE -----------------------------------------------------------
 
-        # --- END FLUX_SHAPE ---
+        # Marker-driven Flux should also drive AoI / motion envelopes.
+        # Otherwise Flux changes while the motion carrier stays mostly measured,
+        # which feels unnaturally decoupled in manual-marker scenes.
+        motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(_override_markers) and (bool(hard_write_flux_aoi) or bool(flux_override_enable))
+        if motion_couple:
+            vx_s, vy_s, vz_s = couple_motion_to_flux_envelope(
+                vx_s, vy_s, vz_s,
+                flux_measured_final,
+                flux_inner,
+                r,
+                fps,
+                markers=_override_markers,
+                force=True,
+                respect_marker_phase_sign=bool(hard_write_flux_aoi),
+            )
+
+            # Use the coupled carrier for downstream export lanes and aggregate pooling.
+            vx = _np.asarray(vx_s, _np.float64)
+            vy = _np.asarray(vy_s, _np.float64)
+            vz = _np.asarray(vz_s, _np.float64)
+
+            ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
+            jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
+
+            kin = _semantic_motion_lanes(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
+            v_al = kin["v_al"]
+            a_al = kin["a_al"]
+            j_al = kin["j_al"]
+
+            axis_v11    = kin["axis_v11"]
+            axis_acc11  = kin["axis_acc11"]
+            axis_jerk11 = kin["axis_jerk11"]
+            axis_dir11  = kin["axis_dir11"]
+
+            lat_v11     = kin["lat_v11"]
+            lat_acc11   = kin["lat_acc11"]
+            lat_jerk11  = kin["lat_jerk11"]
+            lat_dir11   = kin["lat_dir11"]
+            lat_amp01   = kin["lat_amp01"]
+
+            raise_v11    = kin["raise_v11"]
+            raise_acc11  = kin["raise_acc11"]
+            raise_jerk11 = kin["raise_jerk11"]
+            raise_dir11  = kin["raise_dir11"]
+            raise_amp01  = kin["raise_amp01"]
+
+            speed_s = _np.sqrt(vx_s*vx_s + vy_s*vy_s + vz_s*vz_s)
+            acc01 = normalize_unsigned01(_np.sqrt(ax_s*ax_s + ay_s*ay_s + az_s*az_s))
+            jerk01 = normalize_unsigned01(_np.sqrt(jx_s*jx_s + jy_s*jy_s + jz_s*jz_s))
+
+            sigma_ent = max(1.0, 0.35 * fps)
+            slow_ent  = _gauss_blur1d(speed_s, sigma_ent)
+            res_ent   = speed_s - slow_ent
+            entropy_roi = normalize_unsigned01(_np.abs(res_ent))
+
+            jerk_z = _np.maximum(0.0, _mad_z(_np.abs(j_al)))
+            hit_idx = _impact_spike_from_jerk(
+                jerk_z, fps,
+                z_thr=hit_z_thr,
+                min_sep_ms=hit_min_sep,
+                refine_ms=hit_refine_ms
+            )
+            hit_spk = _np.zeros(T, float)
+            for p in hit_idx:
+                if 0 <= int(p) < T:
+                    hit_spk[int(p)] = 1.0
+
+            hit_in_spk  = _np.zeros(T, float)
+            hit_out_spk = _np.zeros(T, float)
+            for p in hit_idx:
+                p = int(p)
+                if p < 0 or p >= T:
+                    continue
+                lab = _classify_flip_sample(io_sign=io_sign, v_al=v_al, p=p, pre=preW, post=postW, v_zero=v_zero)
+                if lab == "in":
+                    hit_in_spk[p] = 1.0
+                elif lab == "out":
+                    hit_out_spk[p] = 1.0
+
+            vP = vx_s if _np.mean(_np.abs(vx_s)) >= _np.mean(_np.abs(vy_s)) else vy_s
 
         # --- END FLUX_LEAK ---
 
@@ -10935,6 +11233,21 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         pz_s = leaky_integrate(vz_s, dt, tau_ms=int(getattr(r, 'posz_tau_ms', 800)))
         posz01_s = normalize_unsigned01(pz_s)
 
+        curv01 = _robust01(_np.abs(curv), p_lo=5, p_hi=95)
+        ms_lanes = compute_local_multiscale_lanes(
+            flux01=flux_inner,
+            entropy01=entropy_roi,
+            jerk01=jerk01,
+            curv01=curv01,
+            speed_abs=speed_s,
+            fps=float(fps),
+        )
+        roi_metric_cache.append(dict(
+            ri=int(ri),
+            labels=list(labels),
+            weight=_roi_scene_weight(r, lowconf),
+            lanes=ms_lanes,
+        ))
 
         for label in labels:
             rows[f"{label}_flux_env"] = flux_inner.tolist()
@@ -16041,6 +16354,7 @@ def run_qt(video_path):
             flux_override_floor=FLUX_OVERRIDE_FLOOR_DEFAULT,
             flux_override_floor_rand=FLUX_OVERRIDE_FLOOR_RAND_DEFAULT,
             flux_override_peak_rand=FLUX_OVERRIDE_PEAK_RAND_DEFAULT,
+            respect_marker_phase_sign=False,
         ) -> Dict[str, np.ndarray]:
             vx = self._fit_len(vx)
             vy = self._fit_len(vy)
@@ -16165,6 +16479,28 @@ def run_qt(video_path):
                 )
                 flux_final = np.clip((1.0 - override_mix) * flux_final + override_mix * flux_override, 0.0, 1.0)
 
+            motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(markers) and (bool(hard_write) or bool(flux_override_enable))
+            if motion_couple:
+                vx_mc, vy_mc, vz_mc = couple_motion_to_flux_envelope(
+                    vx_s, vy_s, vz_s,
+                    flux_measured_final,
+                    flux_final,
+                    r,
+                    fps,
+                    markers=markers,
+                    force=True,
+                    respect_marker_phase_sign=bool(respect_marker_phase_sign),
+                )
+                kin = _semantic_motion_lanes(
+                    vx_mc, vy_mc, vz_mc, fps, r,
+                    lowconf=lowconf,
+                    curv=curv,
+                    igdE=igdE,
+                )
+                axis_v = kin["axis_v11"]
+                lat_amp = kin["lat_amp01"]
+                raise_amp = kin["raise_amp01"]
+
             return {"flux": flux_final, "axis_v": axis_v, "lat_amp": lat_amp, "raise_amp": raise_amp, "vx": vx, "vy": vy, "vz": vz}
 
 
@@ -16231,6 +16567,7 @@ def run_qt(video_path):
                 flux_override_floor=override_floor,
                 flux_override_floor_rand=override_floor_rand,
                 flux_override_peak_rand=override_peak_rand,
+                respect_marker_phase_sign=bool(hard or self.chk_sign.isChecked()),
             )
 
 
@@ -16254,7 +16591,7 @@ def run_qt(video_path):
             raise_curves = [base["raise_amp"]]
 
             show_flux_corr = bool(self.chk_hard.isChecked()) or bool(self.chk_apply.isChecked()) or bool(getattr(self, "chk_flux_override", None) and self.chk_flux_override.isChecked())
-            show_vec_corr  = bool(self.chk_apply.isChecked())
+            show_vec_corr  = bool(self.chk_apply.isChecked()) or bool(self.chk_hard.isChecked()) or bool(getattr(self, "chk_flux_override", None) and self.chk_flux_override.isChecked())
 
             if show_flux_corr:
                 flux_curves.append(corr["flux"])
