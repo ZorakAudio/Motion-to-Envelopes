@@ -3762,6 +3762,158 @@ def pretty_flux_adsr_with_onset_snap01(
     return _np.clip(out, 0.0, 1.0)
 
 
+# --- Manual marker-based Flux override (export menu) -----------------------
+# Goal:
+#   - let hand-placed IN/OUT markers force a deterministic 0..1 envelope
+#     even when measured Flux is weak or absent
+#   - near-instant attack, medium release toward a configurable floor
+#   - deterministic per-phase randomization for floor/peak variation
+#   - cross-fade with the existing measured / pretty Flux path
+FLUX_OVERRIDE_ENABLE_DEFAULT      = False
+FLUX_OVERRIDE_MIX_DEFAULT         = 1.0
+FLUX_OVERRIDE_FLOOR_DEFAULT       = 0.10
+FLUX_OVERRIDE_FLOOR_RAND_DEFAULT  = 0.06
+FLUX_OVERRIDE_PEAK_RAND_DEFAULT   = 0.08
+FLUX_OVERRIDE_ATTACK_MS           = 12.0
+FLUX_OVERRIDE_ATTACK_CURVE        = 0.35   # <1 = fast / front-loaded
+FLUX_OVERRIDE_RELEASE_CURVE       = 1.55   # medium tail toward floor
+FLUX_OVERRIDE_POST_BLUR_SEC       = 0.012
+
+
+def _marker_override_u01(*parts) -> float:
+    """Stable 0..1 pseudo-random number from arbitrary hashable-ish parts."""
+    try:
+        key = json.dumps(parts, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        key = repr(parts)
+    h = hashlib.sha256(key.encode('utf-8', errors='ignore')).digest()
+    return float(int.from_bytes(h[:8], 'big')) / float((1 << 64) - 1)
+
+
+def _sanitize_flux_override_markers(markers, T: int):
+    """Clamp/sort markers for deterministic override-envelope synthesis."""
+    ms = []
+    T = int(max(0, T))
+    for m in (markers or []):
+        try:
+            idx = int(m.get('idx', -1))
+        except Exception:
+            continue
+        if idx < 0 or idx >= T:
+            continue
+        kind = str(m.get('kind', 'IN') or 'IN').upper()
+        kind = 'OUT' if kind.startswith('O') else 'IN'
+        src_idx = m.get('src_idx', None)
+        if src_idx is not None:
+            try:
+                src_idx = float(src_idx)
+            except Exception:
+                src_idx = None
+        ms.append({'idx': int(idx), 'kind': kind, 'src_idx': src_idx})
+
+    ms.sort(key=lambda z: int(z['idx']))
+
+    # same-sample collision: OUT wins
+    ded = []
+    for m in ms:
+        if ded and int(m['idx']) == int(ded[-1]['idx']):
+            if m['kind'] == 'OUT':
+                ded[-1] = m
+            continue
+        ded.append(m)
+    return ded
+
+
+def flux_override_from_markers01(
+    T: int,
+    markers,
+    fps: float,
+    *,
+    seed_key: str = '',
+    floor_target01: float = FLUX_OVERRIDE_FLOOR_DEFAULT,
+    floor_rand01: float = FLUX_OVERRIDE_FLOOR_RAND_DEFAULT,
+    peak_rand01: float = FLUX_OVERRIDE_PEAK_RAND_DEFAULT,
+    attack_ms: float = FLUX_OVERRIDE_ATTACK_MS,
+    attack_curve: float = FLUX_OVERRIDE_ATTACK_CURVE,
+    release_curve: float = FLUX_OVERRIDE_RELEASE_CURVE,
+    post_blur_sec: float = FLUX_OVERRIDE_POST_BLUR_SEC,
+) -> "np.ndarray":
+    """
+    Manual psychoacoustic envelope from marker triggers.
+
+    Every marker (IN or OUT) acts as an envelope trigger:
+      - near-instant attack from current level -> randomised peak
+      - medium release from peak -> randomised floor over the marker span
+
+    Randomisation is deterministic for a given seed_key + marker layout, so
+    preview and CSV export stay visually stable.
+    """
+    import numpy as _np
+
+    T = int(max(0, T))
+    out = _np.zeros(T, _np.float64)
+    if T <= 0:
+        return out
+
+    ms = _sanitize_flux_override_markers(markers, T)
+    if not ms:
+        return out
+
+    floor_target01 = float(_np.clip(floor_target01, 0.0, 0.98))
+    floor_rand01 = float(max(0.0, floor_rand01))
+    peak_rand01 = float(max(0.0, peak_rand01))
+    attack_curve = float(max(1e-6, attack_curve))
+    release_curve = float(max(1e-6, release_curve))
+    attack_fr = max(1, int(round(float(attack_ms) * float(fps) / 1000.0)))
+
+    for i, m in enumerate(ms):
+        a = int(m['idx'])
+        b = int(ms[i + 1]['idx']) if (i + 1) < len(ms) else int(T)
+        if b <= a:
+            continue
+        L = int(b - a)
+        A = int(min(max(1, attack_fr), L))
+        R = int(max(0, L - A))
+
+        srcish = m.get('src_idx', None)
+        if srcish is None:
+            srcish = m.get('idx', a)
+
+        u_floor = _marker_override_u01('flux_floor', seed_key, i, srcish, m.get('kind', 'IN'), T)
+        u_peak = _marker_override_u01('flux_peak', seed_key, i, srcish, m.get('kind', 'IN'), T)
+
+        floor_i = floor_target01 + ((2.0 * float(u_floor)) - 1.0) * floor_rand01
+        floor_i = float(_np.clip(floor_i, 0.0, 0.98))
+
+        peak_lo = max(floor_i + 0.02, 1.0 - peak_rand01)
+        peak_i = float(peak_lo + float(u_peak) * max(0.0, 1.0 - peak_lo))
+        peak_i = float(_np.clip(peak_i, max(0.02, floor_i + 0.02), 1.0))
+
+        start_level = float(out[a - 1]) if a > 0 else 0.0
+
+        if A <= 1:
+            segA = _np.asarray([peak_i], _np.float64)
+        else:
+            ua = _np.linspace(0.0, 1.0, A, endpoint=True, dtype=_np.float64)
+            segA = start_level + (peak_i - start_level) * _np.power(ua, attack_curve)
+
+        if R > 0:
+            ur = _np.linspace(0.0, 1.0, R, endpoint=True, dtype=_np.float64)
+            segR = floor_i + (peak_i - floor_i) * _np.power(1.0 - ur, release_curve)
+            seg = _np.concatenate((segA, segR), axis=0)[:L]
+        else:
+            seg = segA[:L]
+
+        out[a:b] = _np.clip(seg, 0.0, 1.0)
+
+    if post_blur_sec and float(post_blur_sec) > 0.0:
+        sigma = max(1.0, float(post_blur_sec) * float(fps))
+        out = _gauss_blur1d(out, sigma)
+
+    return _np.clip(out, 0.0, 1.0)
+
+
+
 # Goal:
 #   - preserve punchy attacks (instant attack)
 #   - prevent between-stroke collapse (slow/adaptive release)
@@ -8508,6 +8660,108 @@ def normalize_signed11(x):
     mx=_np.max(_np.abs(x))+1e-12
     return x/mx
 
+def _ema_tc_ms(x, fps: float, tc_ms: float):
+    """Cheap O(N) time-constant EMA used by export-only multiscale lanes."""
+    x = _np.asarray(x, _np.float64)
+    if x.size == 0:
+        return x
+    tc_s = max(1e-6, float(tc_ms) / 1000.0)
+    a = 1.0 - _np.exp(-(1.0 / max(1e-6, float(fps))) / tc_s)
+    return _ema(x, float(a))
+
+
+def _trimmed_mean(x, p_lo: float = 15.0, p_hi: float = 85.0) -> float:
+    x = _np.asarray(x, _np.float64)
+    if x.size == 0:
+        return 0.0
+    lo = float(_np.percentile(x, p_lo))
+    hi = float(_np.percentile(x, p_hi))
+    keep = x[(_np.isfinite(x)) & (x >= lo) & (x <= hi)]
+    if keep.size == 0:
+        keep = x[_np.isfinite(x)]
+    return float(_np.mean(keep)) if keep.size else 0.0
+
+
+def _activity_ratio_vs_baseline(activity_abs, clip_hi: float = 4.0):
+    """Clip-relative ratio used for aggregate local-scene context."""
+    a = _np.asarray(activity_abs, _np.float64)
+    if a.size == 0:
+        return a, 0.0
+    baseline = max(1e-6, _trimmed_mean(a, 15.0, 85.0))
+    ratio = _np.clip(a / baseline, 0.0, float(clip_hi))
+    return ratio, float(baseline)
+
+
+def _roi_scene_weight(roi_obj, lowconf_mask=None) -> float:
+    """Static ROI pool weight: sqrt(area) with conservative low-confidence damping."""
+    try:
+        area = float(max(1.0, float(roi_obj.rect[2]) * float(roi_obj.rect[3])))
+    except Exception:
+        area = 1.0
+    w = math.sqrt(max(1.0, area))
+    if lowconf_mask is not None:
+        try:
+            lc = _np.asarray(lowconf_mask, _np.float64)
+            conf = 1.0 - 0.75 * float(_np.clip(_np.mean(lc), 0.0, 1.0))
+            w *= max(0.25, conf)
+        except Exception:
+            pass
+    return float(max(0.10, w))
+
+
+def compute_local_multiscale_lanes(flux01, entropy01, jerk01, curv01=None, speed_abs=None, fps: float = 30.0):
+    """
+    Export-time multiscale local motion lanes.
+    Designed to be cheap: EMAs + simple residuals only.
+
+    Returns 0..1 ROI-local lanes plus an absolute activity series used later
+    for scene-pooled ROI activity ratios.
+    """
+    f = _np.asarray(flux01, _np.float64)
+    e = _np.asarray(entropy01, _np.float64)
+    j = _np.asarray(jerk01, _np.float64)
+    c = _np.zeros_like(f, dtype=_np.float64) if curv01 is None else _np.asarray(curv01, _np.float64)
+
+    if f.size == 0:
+        z = _np.zeros(0, _np.float64)
+        return {
+            "entropy_micro01": z,
+            "entropy_meso01": z,
+            "entropy_macro01": z,
+            "excitement_long01": z,
+            "activity_abs": z,
+        }
+
+    # Timescales tuned for local ROI motion.
+    f_fast = _ema_tc_ms(f, fps, 80.0)
+    f_mid = _ema_tc_ms(f, fps, 360.0)
+    f_long = _ema_tc_ms(f, fps, 1400.0)
+    e_slow = _ema_tc_ms(e, fps, 900.0)
+    c_slow = _ema_tc_ms(c, fps, 1400.0)
+
+    micro_core = 0.70 * _np.abs(f - f_fast) + 0.30 * j
+    meso_core = _np.abs(f_fast - f_mid)
+    macro_core = 0.80 * _np.abs(f_mid - f_long) + 0.15 * e_slow + 0.05 * c_slow
+
+    micro01 = _robust01(micro_core, p_lo=5, p_hi=95)
+    meso01 = _robust01(meso_core, p_lo=5, p_hi=95)
+    macro01 = _robust01(macro_core, p_lo=5, p_hi=95)
+    excitement_long01 = _np.clip(_ema_tc_ms(f, fps, 2200.0), 0.0, 1.0)
+
+    if speed_abs is None:
+        activity_src = f
+    else:
+        activity_src = _np.maximum(0.0, _np.asarray(speed_abs, _np.float64))
+    activity_abs = _ema_tc_ms(activity_src, fps, 700.0)
+
+    return {
+        "entropy_micro01": micro01,
+        "entropy_meso01": meso01,
+        "entropy_macro01": macro01,
+        "excitement_long01": excitement_long01,
+        "activity_abs": activity_abs,
+    }
+
 
 def infer_stutter_flags(vx, vy, vz,
                         dip_ratio: float = 0.20,
@@ -9209,6 +9463,12 @@ def emit_reaper_push(csv_path: str,
                 speed=f"{label}_speed01",
                 acc=f"{label}_acc01",
                 jerk=f"{label}_jerk01",
+                entropy=f"{label}_entropy01",
+                entropymotion=f"{label}_entropy_micro01",
+                entropymeso=f"{label}_entropy_meso01",
+                entropymacro=f"{label}_entropy_macro01",
+                excitement=f"{label}_excitement_long01",
+                activityratio=f"{label}_activity_ratio",
                 impact_in=f"{label}_impact_in01",
                 impact_out=f"{label}_impact_out01",
                 impact_score=f"{label}_impact_score01",
@@ -9233,6 +9493,12 @@ def emit_reaper_push(csv_path: str,
             accy="agg_accy01",
             accz="agg_accz01",
             jerkz="agg_jerkz01",
+            entropy="agg_entropy01",
+            entropymotion="agg_entropy_micro01",
+            entropymeso="agg_entropy_meso01",
+            entropymacro="agg_entropy_macro01",
+            excitement="agg_excitement_long01",
+            activityratio="agg_activity_ratio",
             impact="impact01",
         )
     )
@@ -9768,6 +10034,8 @@ def _cc_range_kind(col: str) -> str:
                                         "_raise_v", "_raise_acc", "_raise_jerk", "_raise_dir",
                                         "_cam_log2_signed")):
         return "bipolar"
+    if col.endswith("_activity_ratio") or col == "agg_activity_ratio":
+        return "ratio25"
     if col.endswith("_deg"):
         return "degrees"
     if col.endswith("01") or col.endswith("_flux_env") or col.endswith("_entropy01"):
@@ -9788,6 +10056,9 @@ def _to_cc_value(x: float, kind: str) -> int:
     if kind == "bipolar":
         v = np.clip(v, -1.0, 1.0)
         return int(round((v * 0.5 + 0.5) * 127.0))
+    if kind == "ratio25":
+        v = np.clip(v, 0.0, 2.5)
+        return int(round((v / 2.5) * 127.0))
     if kind == "degrees":
         # Assume -180..+180 (or -90..+90); map by clamping.
         v = np.clip(v, -180.0, 180.0)
@@ -9823,6 +10094,11 @@ _LOCAL_CC_MAP = {
     "raise_jerk": 50,
     "raise_dir": 51,
     "raise_amp01": 52,
+    "entropy_micro01": 53,
+    "entropy_meso01": 54,
+    "entropy_macro01": 55,
+    "excitement_long01": 56,
+    "activity_ratio": 57,
     # impacts
     "impact_score01": 40,
     "impact_in01": 41,
@@ -9854,6 +10130,8 @@ def _local_lane_key(col: str) -> Optional[str]:
         "axis_v", "axis_acc", "axis_jerk", "axis_dir",
         "lat_v", "lat_acc", "lat_jerk", "lat_dir", "lat_amp01",
         "raise_v", "raise_acc", "raise_jerk", "raise_dir", "raise_amp01",
+        "entropy_micro01", "entropy_meso01", "entropy_macro01",
+        "excitement_long01", "activity_ratio",
         "impact_in01", "impact_out01",
         "impact_in_spk01", "impact_out_spk01",
         "impact_score01",
@@ -10087,7 +10365,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
-def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15, flux_pretty_mix: float = 1.0, flux_onset_snap: float = 0.0):
+def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15, flux_pretty_mix: float = 1.0, flux_onset_snap: float = 0.0, flux_override_enable: bool = False, flux_override_mix: float = FLUX_OVERRIDE_MIX_DEFAULT, flux_override_floor: float = FLUX_OVERRIDE_FLOOR_DEFAULT, flux_override_floor_rand: float = FLUX_OVERRIDE_FLOOR_RAND_DEFAULT, flux_override_peak_rand: float = FLUX_OVERRIDE_PEAK_RAND_DEFAULT):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
       1) Prefer recorded live lanes (scene.roi_imp_in/out) if present.
@@ -10142,6 +10420,7 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
     #   "imp_roles": { "PRIMARY": {"fi":..., "fo":..., "score":...}, "SECONDARY1": {...}, ... }
     # }
     label_slots = {}
+    roi_metric_cache = []
 
 
     _posx_dict = getattr(sc, 'roi_cx', {})
@@ -10266,6 +10545,32 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                 fo_ext[p:end] = 1.0
 
         return fi_ext, fo_ext
+
+    def _role_max(curves):
+        if not curves:
+            return None
+        return _np.max(_np.vstack([_np.asarray(c, _np.float64) for c in curves]), axis=0)
+
+    def _fuse_label_lane_curves(slot, lane_key, w_primary=1.0, w_secondary=0.7, is_ratio=False):
+        lane_curves = slot.get("lane_curves", {}) or {}
+        role_curves = lane_curves.get(lane_key, {}) or {}
+        prim = _role_max(role_curves.get("PRIMARY", []) or [])
+        sec = _role_max(role_curves.get("SECONDARY", []) or [])
+        parts = []
+        weights = []
+        if prim is not None:
+            parts.append(prim); weights.append(float(w_primary))
+        if sec is not None:
+            parts.append(sec); weights.append(float(w_secondary))
+        if not parts:
+            return None
+        fused = _np.zeros_like(parts[0], _np.float64)
+        wsum = 0.0
+        for w, arr in zip(weights, parts):
+            fused += float(w) * _np.asarray(arr, _np.float64)
+            wsum += float(w)
+        fused /= max(1e-12, wsum)
+        return _np.clip(fused, 0.0, 4.0 if is_ratio else 1.0)
 
 
     for ri, r in enumerate(sc.rois):
@@ -10525,6 +10830,24 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             flux_measured_final = flux_leaky_shape01(flux_measured_final, entropy_roi, fps)
         flux_measured_final = _np.clip(flux_measured_final, 0.0, 1.0)
 
+        acc01 = normalize_unsigned01(_np.sqrt(ax_s*ax_s + ay_s*ay_s + az_s*az_s))
+        jerk01 = normalize_unsigned01(_np.sqrt(jx_s*jx_s + jy_s*jy_s + jz_s*jz_s))
+        curv01 = _robust01(_np.abs(curv), p_lo=5, p_hi=95)
+        ms_lanes = compute_local_multiscale_lanes(
+            flux01=flux_measured_final,
+            entropy01=entropy_roi,
+            jerk01=jerk01,
+            curv01=curv01,
+            speed_abs=speed_s,
+            fps=float(fps),
+        )
+        roi_metric_cache.append(dict(
+            ri=int(ri),
+            labels=list(labels),
+            weight=_roi_scene_weight(r, lowconf),
+            lanes=ms_lanes,
+        ))
+
         # Default output (no hard write): measured final
         flux_inner = flux_measured_final
 
@@ -10561,21 +10884,40 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             # Micro bleed: measured_final leaked back in (detail/jitter)
             flux_inner = _np.clip((1.0 - bleed) * base + bleed * flux_measured_final, 0.0, 1.0)
 
+        # 2) Manual marker override (works even when measured Flux is weak)
+        if bool(flux_override_enable) and _override_markers:
+            try:
+                override_mix = float(flux_override_mix)
+            except Exception:
+                override_mix = float(FLUX_OVERRIDE_MIX_DEFAULT)
+            override_mix = max(0.0, min(1.0, override_mix))
 
-        else:
-            # legacy flux shaping (accuracy / measurement-based)
-            if FLUX_REL50_ENABLE:
-                flux_inner = flux_release_to_target_by_phase01(
-                    flux_inner,
-                    entropy_roi,
-                    v_al,                 # AoI axis velocity
-                    fps,
-                    io_in_sign=int(getattr(r, "io_in_sign", +1)),
-                    v_zero=float(getattr(r, "impact_flip_deadband_ps", V_ZERO)),
-                    target=float(FLUX_REL50_TARGET),
-                )
-            elif FLUX_LEAK_ENABLE:
-                flux_inner = flux_leaky_shape01(flux_inner, entropy_roi, fps)
+            try:
+                override_floor = float(flux_override_floor)
+            except Exception:
+                override_floor = float(FLUX_OVERRIDE_FLOOR_DEFAULT)
+            override_floor = max(0.0, min(1.0, override_floor))
+
+            try:
+                override_floor_rand = float(flux_override_floor_rand)
+            except Exception:
+                override_floor_rand = float(FLUX_OVERRIDE_FLOOR_RAND_DEFAULT)
+            override_floor_rand = max(0.0, min(1.0, override_floor_rand))
+
+            try:
+                override_peak_rand = float(flux_override_peak_rand)
+            except Exception:
+                override_peak_rand = float(FLUX_OVERRIDE_PEAK_RAND_DEFAULT)
+            override_peak_rand = max(0.0, min(1.0, override_peak_rand))
+
+            flux_override = flux_override_from_markers01(
+                T, _override_markers, fps,
+                seed_key=f"scene{int(scene_id)}:roi{int(ri)}",
+                floor_target01=override_floor,
+                floor_rand01=override_floor_rand,
+                peak_rand01=override_peak_rand,
+            )
+            flux_inner = _np.clip((1.0 - override_mix) * flux_inner + override_mix * flux_override, 0.0, 1.0)
         # --- END FLUX_SHAPE -----------------------------------------------------------
 
         # --- END FLUX_SHAPE ---
@@ -10604,8 +10946,8 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             rows[f"{label}_posz01"]   = posz01_s.tolist()
 
             rows[f"{label}_speed01"]  = normalize_unsigned01(speed_s).tolist()
-            rows[f"{label}_acc01"]    = normalize_unsigned01(_np.sqrt(ax_s*ax_s + ay_s*ay_s + az_s*az_s)).tolist()
-            rows[f"{label}_jerk01"]   = normalize_unsigned01(_np.sqrt(jx_s*jx_s + jy_s*jy_s + jz_s*jz_s)).tolist()
+            rows[f"{label}_acc01"]    = acc01.tolist()
+            rows[f"{label}_jerk01"]   = jerk01.tolist()
 
             rows[f"{label}_entropy01"] = entropy_roi.tolist()
 
@@ -10780,7 +11122,9 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                     "primary": None,
                     "primary_curves": [],
                     "secondary_curves": [],
-                    "imp_roles": {}
+                    "imp_roles": {},
+                    "lane_curves": {},
+                    "roi_roles": {},
                 })
                 primary_ri = lp.get(lab, None)
                 # Decide role for this ROI under this label
@@ -10793,6 +11137,8 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                     # assign stable secondary index
                     existing_secs = [r for r in slot["imp_roles"].keys() if r.startswith("SECONDARY")]
                     role = f"SECONDARY{len(existing_secs)+1}"
+
+                slot["roi_roles"][ri] = role
 
                 # Store this ROI's normalized curve per role
                 if role == "PRIMARY":
@@ -10840,6 +11186,44 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         agg_vx.append(vx); agg_vy.append(vy); agg_vz.append(vz)
         agg_pz.append(leaky_integrate(vz_s, dt, tau_ms=int(getattr(r, 'posz_tau_ms', 800))))
 
+    # --- ROI-local multiscale lanes + pooled local-scene context ---
+    if roi_metric_cache:
+        weights = _np.asarray([float(item.get("weight", 1.0)) for item in roi_metric_cache], _np.float64)
+        if (weights.size == 0) or (not _np.any(_np.isfinite(weights))) or float(_np.sum(weights)) <= 0.0:
+            weights = _np.ones(len(roi_metric_cache), _np.float64)
+
+        pool_activity_abs = _np.zeros(T, _np.float64)
+        for w, item in zip(weights, roi_metric_cache):
+            pool_activity_abs += float(w) * _np.asarray(item["lanes"]["activity_abs"], _np.float64)
+        pool_activity_abs /= max(1e-12, float(_np.sum(weights)))
+        pool_activity_abs = _np.maximum(pool_activity_abs, 1e-6)
+
+        for item in roi_metric_cache:
+            lanes = dict(item.get("lanes") or {})
+            activity_ratio = _np.clip(_np.asarray(lanes.get("activity_abs", _np.zeros(T)), _np.float64) / pool_activity_abs, 0.0, 4.0)
+            lanes["activity_ratio"] = activity_ratio
+            labels_i = list(item.get("labels") or [])
+            ri_i = int(item.get("ri", -1))
+
+            if label_mode == "per_roi":
+                for label in labels_i:
+                    rows[f"{label}_entropy_micro01"] = _np.asarray(lanes["entropy_micro01"], _np.float64).tolist()
+                    rows[f"{label}_entropy_meso01"] = _np.asarray(lanes["entropy_meso01"], _np.float64).tolist()
+                    rows[f"{label}_entropy_macro01"] = _np.asarray(lanes["entropy_macro01"], _np.float64).tolist()
+                    rows[f"{label}_excitement_long01"] = _np.asarray(lanes["excitement_long01"], _np.float64).tolist()
+                    rows[f"{label}_activity_ratio"] = activity_ratio.tolist()
+            elif label_mode == "per_label":
+                for lab in labels_i:
+                    slot = label_slots.get(lab)
+                    if not slot:
+                        continue
+                    role = str((slot.get("roi_roles", {}) or {}).get(ri_i, "PRIMARY"))
+                    role_key = "PRIMARY" if role == "PRIMARY" else "SECONDARY"
+                    lane_curves = slot.setdefault("lane_curves", {})
+                    for lane_key in ("entropy_micro01", "entropy_meso01", "entropy_macro01", "excitement_long01", "activity_ratio"):
+                        bucket = lane_curves.setdefault(lane_key, {"PRIMARY": [], "SECONDARY": []})
+                        bucket[role_key].append(_np.asarray(lanes[lane_key], _np.float64).copy())
+
     # --- Kinetic Label Engine: per-label aggregated lanes ---
     if label_mode == "per_label" and label_slots:
         w_p = 1.0   # PRIMARY weight
@@ -10881,6 +11265,11 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
             # This is the env lane the bridge uses for this label
             rows[f"{lab}_flux_env"] = flux_final.tolist()
+
+            for lane_key in ("entropy_micro01", "entropy_meso01", "entropy_macro01", "excitement_long01", "activity_ratio"):
+                fused_lane = _fuse_label_lane_curves(slot, lane_key, w_primary=w_p, w_secondary=w_s, is_ratio=(lane_key == "activity_ratio"))
+                if fused_lane is not None:
+                    rows[f"{lab}_{lane_key}"] = _np.asarray(fused_lane, _np.float64).tolist()
 
             # per-role impacts for label (unchanged)
             for role, data in slot.get("imp_roles", {}).items():
@@ -10939,6 +11328,22 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
     agg_res   = flux_env_raw - agg_slow
     agg_entropy01 = normalize_unsigned01(_np.abs(agg_res))
     rows["agg_entropy01"] = agg_entropy01.tolist()
+
+    agg_jerk01 = normalize_unsigned01(_np.abs(jzm_s))
+    agg_ms_lanes = compute_local_multiscale_lanes(
+        flux01=_np.asarray(rows["flux_env"], _np.float64),
+        entropy01=agg_entropy01,
+        jerk01=agg_jerk01,
+        curv01=None,
+        speed_abs=flux_env_raw,
+        fps=float(fps),
+    )
+    rows["agg_entropy_micro01"] = _np.asarray(agg_ms_lanes["entropy_micro01"], _np.float64).tolist()
+    rows["agg_entropy_meso01"] = _np.asarray(agg_ms_lanes["entropy_meso01"], _np.float64).tolist()
+    rows["agg_entropy_macro01"] = _np.asarray(agg_ms_lanes["entropy_macro01"], _np.float64).tolist()
+    rows["agg_excitement_long01"] = _np.asarray(agg_ms_lanes["excitement_long01"], _np.float64).tolist()
+    agg_activity_ratio, _agg_baseline = _activity_ratio_vs_baseline(agg_ms_lanes["activity_abs"], clip_hi=4.0)
+    rows["agg_activity_ratio"] = _np.asarray(agg_activity_ratio, _np.float64).tolist()
 
 
     # final length alignment
@@ -12706,7 +13111,12 @@ def run_qt(video_path):
                     pass
 
                 sc_out = sc_trim
-                phase_markers = None
+                needs_phase_markers = bool(markers_by_roi) and (
+                    bool(apply_correction) or
+                    bool(opts.get("hard_write_flux_aoi", False)) or
+                    bool(opts.get("flux_override_enable", False))
+                )
+                phase_markers = markers_by_roi if needs_phase_markers else None
 
                 if apply_correction and markers_by_roi:
                     sc_out = apply_export_marker_corrections(
@@ -12716,8 +13126,6 @@ def run_qt(video_path):
                         enforce_aoi_sign=bool(opts.get("enforce_aoi_sign", True)),
                         hard_write_flux_aoi=bool(opts.get("hard_write_flux_aoi", False)),
                     )
-
-                    phase_markers = markers_by_roi
 
                 sc_for_ai = sc_out
                 csv_path = save_scene_csv_and_push(
@@ -12732,6 +13140,11 @@ def run_qt(video_path):
                     flux_measured_bleed=float(opts.get("flux_measured_bleed", 0.15)),
                     flux_pretty_mix=float(opts.get("flux_pretty_mix", PRETTY_FLUX_MIX)),
                     flux_onset_snap=float(opts.get("flux_onset_snap", 0.0)),
+                    flux_override_enable=bool(opts.get("flux_override_enable", False)),
+                    flux_override_mix=float(opts.get("flux_override_mix", FLUX_OVERRIDE_MIX_DEFAULT)),
+                    flux_override_floor=float(opts.get("flux_override_floor", FLUX_OVERRIDE_FLOOR_DEFAULT)),
+                    flux_override_floor_rand=float(opts.get("flux_override_floor_rand", FLUX_OVERRIDE_FLOOR_RAND_DEFAULT)),
+                    flux_override_peak_rand=float(opts.get("flux_override_peak_rand", FLUX_OVERRIDE_PEAK_RAND_DEFAULT)),
 
                 )
             else:
@@ -14973,6 +15386,11 @@ def run_qt(video_path):
             self.chk_apply = QtWidgets.QCheckBox("Apply corrections from markers on export")
             self.chk_warp = QtWidgets.QCheckBox("Time-warp (stretch/compress) between markers")
             self.chk_hard = QtWidgets.QCheckBox("Hard-write Flux/AoI (stronger re-timing)")
+            self.chk_flux_override = QtWidgets.QCheckBox("Override Flux from markers")
+            self.chk_flux_override.setToolTip(
+                "Force a deterministic marker-driven 0..1 Flux envelope even when measured Flux is weak.\n"
+                "This is independent of measured magnitude and cross-fades with the current Flux path."
+            )
             self.chk_pos  = QtWidgets.QCheckBox("Also warp center (cx/cy)")
             self.chk_sign = QtWidgets.QCheckBox("Enforce AoI IN/OUT sign by marker phase")
             
@@ -15009,14 +15427,55 @@ def run_qt(video_path):
             self.sld_flux_onset = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             self.sld_flux_onset.setRange(0, 100)
 
+            # (D) Manual marker override crossfade + floor / variation
+            self.lbl_flux_override_mix = QtWidgets.QLabel("Override mix: 100%")
+            self.lbl_flux_override_mix.setToolTip(
+                "Cross-fade between the current Flux path and the manual marker-driven override envelope.\n"
+                "0% = keep current Flux\n"
+                "100% = full override"
+            )
+            self.sld_flux_override_mix = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_override_mix.setRange(0, 100)
+
+            self.lbl_flux_override_floor = QtWidgets.QLabel("Override floor: 10%")
+            self.lbl_flux_override_floor.setToolTip(
+                "Minimum Flux target reached by the marker-driven override tail."
+            )
+            self.sld_flux_override_floor = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_override_floor.setRange(0, 100)
+
+            self.lbl_flux_override_floor_rand = QtWidgets.QLabel("Floor variation: ±6%")
+            self.lbl_flux_override_floor_rand.setToolTip(
+                "Deterministic per-phase randomisation of the override floor.\n"
+                "Higher values = more variation between marker phases."
+            )
+            self.sld_flux_override_floor_rand = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_override_floor_rand.setRange(0, 100)
+
+            self.lbl_flux_override_peak_rand = QtWidgets.QLabel("Peak variation: 8%")
+            self.lbl_flux_override_peak_rand.setToolTip(
+                "Deterministic per-phase randomisation of the override peak.\n"
+                "0% = every peak hits 100%; higher values vary peak strength."
+            )
+            self.sld_flux_override_peak_rand = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_flux_override_peak_rand.setRange(0, 100)
+
             _saved = self._saved_opts if isinstance(getattr(self, "_saved_opts", None), dict) else {}
             _default_mix   = float(_saved.get("flux_pretty_mix", PRETTY_FLUX_MIX))
             _default_bleed = float(_saved.get("flux_measured_bleed", 0.15))
             _default_onset = float(_saved.get("flux_onset_snap", 0.35))
+            _default_override_mix = float(_saved.get("flux_override_mix", FLUX_OVERRIDE_MIX_DEFAULT))
+            _default_override_floor = float(_saved.get("flux_override_floor", FLUX_OVERRIDE_FLOOR_DEFAULT))
+            _default_override_floor_rand = float(_saved.get("flux_override_floor_rand", FLUX_OVERRIDE_FLOOR_RAND_DEFAULT))
+            _default_override_peak_rand = float(_saved.get("flux_override_peak_rand", FLUX_OVERRIDE_PEAK_RAND_DEFAULT))
 
             self.sld_flux_mix.setValue(int(round(100.0 * max(0.0, min(1.0, _default_mix)))))
             self.sld_flux_bleed.setValue(int(round(100.0 * max(0.0, min(1.0, _default_bleed)))))
             self.sld_flux_onset.setValue(int(round(100.0 * max(0.0, min(1.0, _default_onset)))))
+            self.sld_flux_override_mix.setValue(int(round(100.0 * max(0.0, min(1.0, _default_override_mix)))))
+            self.sld_flux_override_floor.setValue(int(round(100.0 * max(0.0, min(1.0, _default_override_floor)))))
+            self.sld_flux_override_floor_rand.setValue(int(round(100.0 * max(0.0, min(1.0, _default_override_floor_rand)))))
+            self.sld_flux_override_peak_rand.setValue(int(round(100.0 * max(0.0, min(1.0, _default_override_peak_rand)))))
 
             row_mix = QtWidgets.QHBoxLayout()
             row_mix.addWidget(self.lbl_flux_mix)
@@ -15032,6 +15491,26 @@ def run_qt(video_path):
             row_onset.addWidget(self.lbl_flux_onset)
             row_onset.addWidget(self.sld_flux_onset, 1)
             opt.addLayout(row_onset)
+
+            row_override_mix = QtWidgets.QHBoxLayout()
+            row_override_mix.addWidget(self.lbl_flux_override_mix)
+            row_override_mix.addWidget(self.sld_flux_override_mix, 1)
+            opt.addLayout(row_override_mix)
+
+            row_override_floor = QtWidgets.QHBoxLayout()
+            row_override_floor.addWidget(self.lbl_flux_override_floor)
+            row_override_floor.addWidget(self.sld_flux_override_floor, 1)
+            opt.addLayout(row_override_floor)
+
+            row_override_floor_rand = QtWidgets.QHBoxLayout()
+            row_override_floor_rand.addWidget(self.lbl_flux_override_floor_rand)
+            row_override_floor_rand.addWidget(self.sld_flux_override_floor_rand, 1)
+            opt.addLayout(row_override_floor_rand)
+
+            row_override_peak_rand = QtWidgets.QHBoxLayout()
+            row_override_peak_rand.addWidget(self.lbl_flux_override_peak_rand)
+            row_override_peak_rand.addWidget(self.sld_flux_override_peak_rand, 1)
+            opt.addLayout(row_override_peak_rand)
 
             def _mix_changed(v):
                 self.lbl_flux_mix.setText(f"Pretty mix: {int(v)}%")
@@ -15054,17 +15533,54 @@ def run_qt(video_path):
                 except Exception:
                     pass
 
+            def _override_mix_changed(v):
+                self.lbl_flux_override_mix.setText(f"Override mix: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
+            def _override_floor_changed(v):
+                self.lbl_flux_override_floor.setText(f"Override floor: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
+            def _override_floor_rand_changed(v):
+                self.lbl_flux_override_floor_rand.setText(f"Floor variation: ±{int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
+            def _override_peak_rand_changed(v):
+                self.lbl_flux_override_peak_rand.setText(f"Peak variation: {int(v)}%")
+                try:
+                    self._update_preview()
+                except Exception:
+                    pass
+
             self.sld_flux_mix.valueChanged.connect(_mix_changed)
             self.sld_flux_bleed.valueChanged.connect(_bleed_changed)
             self.sld_flux_onset.valueChanged.connect(_onset_changed)
+            self.sld_flux_override_mix.valueChanged.connect(_override_mix_changed)
+            self.sld_flux_override_floor.valueChanged.connect(_override_floor_changed)
+            self.sld_flux_override_floor_rand.valueChanged.connect(_override_floor_rand_changed)
+            self.sld_flux_override_peak_rand.valueChanged.connect(_override_peak_rand_changed)
             _mix_changed(self.sld_flux_mix.value())
             _bleed_changed(self.sld_flux_bleed.value())
             _onset_changed(self.sld_flux_onset.value())
+            _override_mix_changed(self.sld_flux_override_mix.value())
+            _override_floor_changed(self.sld_flux_override_floor.value())
+            _override_floor_rand_changed(self.sld_flux_override_floor_rand.value())
+            _override_peak_rand_changed(self.sld_flux_override_peak_rand.value())
 
 
             opt.addWidget(self.chk_apply)
             opt.addWidget(self.chk_warp)
             opt.addWidget(self.chk_hard)
+            opt.addWidget(self.chk_flux_override)
             opt.addWidget(self.chk_pos)
             opt.addWidget(self.chk_sign)
 
@@ -15076,6 +15592,7 @@ def run_qt(video_path):
             self.chk_pos.setChecked(True)
             self.chk_sign.setChecked(True)
             self.chk_hard.setChecked(False)
+            self.chk_flux_override.setChecked(bool(_saved.get("flux_override_enable", FLUX_OVERRIDE_ENABLE_DEFAULT)))
 
             if isinstance(self._saved_opts, dict):
                 self.chk_apply.setChecked(bool(self._saved_opts.get("apply", self.chk_apply.isChecked())))
@@ -15083,6 +15600,7 @@ def run_qt(video_path):
                 self.chk_pos.setChecked(bool(self._saved_opts.get("warp_positions", True)))
                 self.chk_sign.setChecked(bool(self._saved_opts.get("enforce_aoi_sign", True)))
                 self.chk_hard.setChecked(bool(self._saved_opts.get("hard_write_flux_aoi", False)))
+                self.chk_flux_override.setChecked(bool(self._saved_opts.get("flux_override_enable", self.chk_flux_override.isChecked())))
 
 
             # buttons
@@ -15115,6 +15633,7 @@ def run_qt(video_path):
             self.btn_del_all.clicked.connect(self._delete_all)
             self.btn_merge.clicked.connect(self._merge_markers)
             self.chk_hard.toggled.connect(self._update_preview)
+            self.chk_flux_override.toggled.connect(self._update_preview)
 
 
             # init view
@@ -15517,6 +16036,11 @@ def run_qt(video_path):
             flux_pretty_mix=1.0,
             flux_measured_bleed=0.15,
             flux_onset_snap=0.0,
+            flux_override_enable=False,
+            flux_override_mix=FLUX_OVERRIDE_MIX_DEFAULT,
+            flux_override_floor=FLUX_OVERRIDE_FLOOR_DEFAULT,
+            flux_override_floor_rand=FLUX_OVERRIDE_FLOOR_RAND_DEFAULT,
+            flux_override_peak_rand=FLUX_OVERRIDE_PEAK_RAND_DEFAULT,
         ) -> Dict[str, np.ndarray]:
             vx = self._fit_len(vx)
             vy = self._fit_len(vy)
@@ -15626,6 +16150,21 @@ def run_qt(video_path):
                 base = np.clip((1.0 - mix) * flux_measured_final + mix * pretty, 0.0, 1.0)
                 flux_final = np.clip((1.0 - bleed) * base + bleed * flux_measured_final, 0.0, 1.0)
 
+            if bool(flux_override_enable) and markers:
+                override_mix = max(0.0, min(1.0, float(flux_override_mix)))
+                override_floor = max(0.0, min(1.0, float(flux_override_floor)))
+                override_floor_rand = max(0.0, min(1.0, float(flux_override_floor_rand)))
+                override_peak_rand = max(0.0, min(1.0, float(flux_override_peak_rand)))
+
+                flux_override = flux_override_from_markers01(
+                    int(len(flux_raw01)), markers, fps,
+                    seed_key=f"scene{int(self.scene_id)}:roi{int(ri)}",
+                    floor_target01=override_floor,
+                    floor_rand01=override_floor_rand,
+                    peak_rand01=override_peak_rand,
+                )
+                flux_final = np.clip((1.0 - override_mix) * flux_final + override_mix * flux_override, 0.0, 1.0)
+
             return {"flux": flux_final, "axis_v": axis_v, "lat_amp": lat_amp, "raise_amp": raise_amp, "vx": vx, "vy": vy, "vz": vz}
 
 
@@ -15673,7 +16212,12 @@ def run_qt(video_path):
             pretty_mix = float(self.sld_flux_mix.value()) / 100.0 if hasattr(self, "sld_flux_mix") else float(PRETTY_FLUX_MIX)
             bleed = float(self.sld_flux_bleed.value()) / 100.0 if hasattr(self, "sld_flux_bleed") else 0.15
             onset = float(self.sld_flux_onset.value()) / 100.0 if hasattr(self, "sld_flux_onset") else 0.0
+            override_mix = float(self.sld_flux_override_mix.value()) / 100.0 if hasattr(self, "sld_flux_override_mix") else float(FLUX_OVERRIDE_MIX_DEFAULT)
+            override_floor = float(self.sld_flux_override_floor.value()) / 100.0 if hasattr(self, "sld_flux_override_floor") else float(FLUX_OVERRIDE_FLOOR_DEFAULT)
+            override_floor_rand = float(self.sld_flux_override_floor_rand.value()) / 100.0 if hasattr(self, "sld_flux_override_floor_rand") else float(FLUX_OVERRIDE_FLOOR_RAND_DEFAULT)
+            override_peak_rand = float(self.sld_flux_override_peak_rand.value()) / 100.0 if hasattr(self, "sld_flux_override_peak_rand") else float(FLUX_OVERRIDE_PEAK_RAND_DEFAULT)
             hard = bool(self.chk_hard.isChecked())
+            override_enable = bool(self.chk_flux_override.isChecked()) if hasattr(self, "chk_flux_override") else False
 
             return self._compute_preview_from_v(
                 ri, vx, vy, vz,
@@ -15682,6 +16226,11 @@ def run_qt(video_path):
                 flux_pretty_mix=pretty_mix,
                 flux_measured_bleed=bleed,
                 flux_onset_snap=onset,
+                flux_override_enable=override_enable,
+                flux_override_mix=override_mix,
+                flux_override_floor=override_floor,
+                flux_override_floor_rand=override_floor_rand,
+                flux_override_peak_rand=override_peak_rand,
             )
 
 
@@ -15704,7 +16253,7 @@ def run_qt(video_path):
             lat_curves  = [base["lat_amp"]]
             raise_curves = [base["raise_amp"]]
 
-            show_flux_corr = bool(self.chk_hard.isChecked()) or bool(self.chk_apply.isChecked())
+            show_flux_corr = bool(self.chk_hard.isChecked()) or bool(self.chk_apply.isChecked()) or bool(getattr(self, "chk_flux_override", None) and self.chk_flux_override.isChecked())
             show_vec_corr  = bool(self.chk_apply.isChecked())
 
             if show_flux_corr:
@@ -15720,7 +16269,10 @@ def run_qt(video_path):
             self.plot_raise.set_data(raise_curves, ms)
 
             dirty = bool(self._dirty_by_roi.get(ri, False))
-            self.lbl_status.setText(f"markers={len(ms)}  dirty={dirty}  apply={self.chk_apply.isChecked()}")
+            self.lbl_status.setText(
+                f"markers={len(ms)}  dirty={dirty}  apply={self.chk_apply.isChecked()}  "
+                f"hard={self.chk_hard.isChecked()}  override={bool(getattr(self, 'chk_flux_override', None) and self.chk_flux_override.isChecked())}"
+            )
 
         def _pv_cache_get(self, frame_idx: int):
             fr = self._pv_cache.get(frame_idx, None)
@@ -16009,6 +16561,11 @@ def run_qt(video_path):
                 "flux_pretty_mix": float(self.sld_flux_mix.value()) / 100.0,
                 "flux_measured_bleed": float(self.sld_flux_bleed.value()) / 100.0,
                 "flux_onset_snap": float(self.sld_flux_onset.value()) / 100.0,
+                "flux_override_enable": bool(getattr(self, "chk_flux_override", None) and self.chk_flux_override.isChecked()),
+                "flux_override_mix": float(self.sld_flux_override_mix.value()) / 100.0,
+                "flux_override_floor": float(self.sld_flux_override_floor.value()) / 100.0,
+                "flux_override_floor_rand": float(self.sld_flux_override_floor_rand.value()) / 100.0,
+                "flux_override_peak_rand": float(self.sld_flux_override_peak_rand.value()) / 100.0,
             }
 
             # markers per roi
