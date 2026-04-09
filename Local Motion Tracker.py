@@ -9096,6 +9096,145 @@ def _sign_coherence01(x, fps: float, win_ms: float = 120.0, dead_frac: float = 0
     return _np.clip(coh * _np.maximum(0.25, amp01), 0.0, 1.0)
 
 
+
+
+def _median3_reflect(x):
+    x = _np.asarray(x, _np.float64)
+    n = int(x.size)
+    if n == 0:
+        return x.copy()
+    if n < 3:
+        return x.copy()
+    xp = _np.pad(x, (1, 1), mode="edge")
+    return _np.median(_np.stack([xp[:-2], xp[1:-1], xp[2:]], axis=0), axis=0)
+
+
+def _binomial5_reflect(x):
+    x = _np.asarray(x, _np.float64)
+    n = int(x.size)
+    if n == 0:
+        return x.copy()
+    if n < 5:
+        return _median3_reflect(x)
+    xp = _np.pad(x, (2, 2), mode="edge")
+    return (xp[:-4] + 4.0 * xp[1:-3] + 6.0 * xp[2:-2] + 4.0 * xp[3:-1] + xp[4:]) / 16.0
+
+
+def _zero_phase_box01(x, radius: int):
+    x = _np.asarray(x, _np.float64)
+    n = int(x.size)
+    if n == 0 or radius <= 0:
+        return x.copy()
+    radius = int(radius)
+    klen = radius * 2 + 1
+    xp = _np.pad(x, (radius, radius), mode="edge")
+    k = _np.ones(klen, _np.float64) / float(klen)
+    return _np.convolve(xp, k, mode="valid")[:n]
+
+
+def _condition_1d_jerk_zero_phase(v, fps: float, *, strength: float = 0.72, shock_z: float = 2.35,
+                                  protect_ms: float = 18.0, lowconf=None, curv=None, igdE=None):
+    """
+    Symmetric local conditioner:
+      - detects single/tiny-cluster jerk shocks
+      - blends toward median/binomial zero-phase estimates
+      - protects coherent, high-amplitude motion so timing stays locked
+    """
+    v = _np.asarray(v, _np.float64)
+    n = int(v.size)
+    if n < 5:
+        return v.copy()
+
+    dt = 1.0 / max(1e-6, float(fps))
+    a = _deriv_central(v, dt)
+    j = _deriv_central(a, dt)
+
+    dd = _np.zeros_like(v, _np.float64)
+    dd[1:-1] = v[2:] - 2.0 * v[1:-1] + v[:-2]
+
+    shock = _np.maximum(0.0, _mad_z(_np.abs(j)))
+    shock = _np.maximum(shock, _np.maximum(0.0, _mad_z(_np.abs(dd))))
+
+    if lowconf is not None:
+        lc = _fit_series_len(lowconf, n, fill=False, dtype=bool).astype(_np.float64)
+        shock = shock + 0.80 * lc
+
+    if curv is not None:
+        c01 = _robust_abs01(_fit_series_len(curv, n, fill=0.0, dtype=_np.float64), 90.0)
+        shock = shock + 0.18 * c01
+
+    if igdE is not None:
+        ig = _fit_series_len(igdE, n, fill=0.0, dtype=_np.float64)
+        ig01 = _np.clip(_np.abs(_mad_z(ig)) / 3.0, 0.0, 1.0)
+        shock = shock + 0.14 * ig01
+
+    amp01 = _robust_abs01(v, 90.0)
+    coh01 = _sign_coherence01(v, fps, win_ms=85.0, dead_frac=0.12)
+    protect = _np.clip(0.40 * amp01 + 0.55 * coh01, 0.0, 1.0)
+
+    w = _np.clip((shock - float(shock_z)) / 2.0, 0.0, 1.0)
+    w = _np.clip(w * float(strength) * (1.0 - 0.78 * protect), 0.0, 0.95)
+
+    rad = max(0, int(round(float(protect_ms) * float(fps) / 1000.0)))
+    if rad > 0:
+        w = _np.clip(_zero_phase_box01(w, rad), 0.0, 0.95)
+
+    med = _median3_reflect(v)
+    smooth = _binomial5_reflect(v)
+    return (1.0 - w) * v + w * (0.60 * med + 0.40 * smooth)
+
+
+def condition_export_kinematics(vx_s, vy_s, vz_s, fps: float, r, *, lowconf=None, curv=None, igdE=None):
+    """
+    Apply jerk-only conditioning to export/preview carriers.
+    Defaults are intentionally conservative and can be overridden per ROI by
+    setting:
+      r.jerk_smooth_xy
+      r.jerk_smooth_z
+      r.jerk_shock_xy_z
+      r.jerk_shock_z_z
+      r.jerk_protect_ms
+    """
+    vx_s = _np.asarray(vx_s, _np.float64)
+    vy_s = _np.asarray(vy_s, _np.float64)
+    vz_s = _np.asarray(vz_s, _np.float64)
+    n = int(min(vx_s.size, vy_s.size, vz_s.size))
+    if n <= 0:
+        return vx_s[:0], vy_s[:0], vz_s[:0]
+
+    vx_s = vx_s[:n]
+    vy_s = vy_s[:n]
+    vz_s = vz_s[:n]
+
+    low_fit = _fit_series_len(lowconf, n, fill=False, dtype=bool) if lowconf is not None else None
+    curv_fit = _fit_series_len(curv, n, fill=0.0, dtype=_np.float64) if curv is not None else None
+    igdE_fit = _fit_series_len(igdE, n, fill=0.0, dtype=_np.float64) if igdE is not None else None
+
+    xy_strength = float(getattr(r, "jerk_smooth_xy", 0.72) or 0.72)
+    z_strength = float(getattr(r, "jerk_smooth_z", 0.84) or 0.84)
+    shock_xy = float(getattr(r, "jerk_shock_xy_z", 2.35) or 2.35)
+    shock_z = float(getattr(r, "jerk_shock_z_z", 2.05) or 2.05)
+    protect_ms = float(getattr(r, "jerk_protect_ms", 18.0) or 18.0)
+
+    vx_c = _condition_1d_jerk_zero_phase(
+        vx_s, fps,
+        strength=xy_strength, shock_z=shock_xy, protect_ms=protect_ms,
+        lowconf=low_fit, curv=curv_fit, igdE=igdE_fit,
+    )
+    vy_c = _condition_1d_jerk_zero_phase(
+        vy_s, fps,
+        strength=xy_strength, shock_z=shock_xy, protect_ms=protect_ms,
+        lowconf=low_fit, curv=curv_fit, igdE=igdE_fit,
+    )
+    vz_c = _condition_1d_jerk_zero_phase(
+        vz_s, fps,
+        strength=z_strength, shock_z=shock_z, protect_ms=protect_ms,
+        lowconf=low_fit, curv=curv_fit, igdE=igdE_fit,
+    )
+    return vx_c, vy_c, vz_c
+
+
+
 def _semantic_motion_lanes(vx_s, vy_s, vz_s, fps: float, r,
                            *, lowconf=None, curv=None, igdE=None):
     """
@@ -10885,6 +11024,12 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                                         fast_win_ms=24,  fast_ema_ms=40)
         # -------------------------------------------------------------
 
+        vx_s, vy_s, vz_s = condition_export_kinematics(
+            vx_s, vy_s, vz_s, fps, r,
+            lowconf=lowconf,
+            curv=curv,
+            igdE=igdE,
+        )
         ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
         jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
@@ -11134,6 +11279,8 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             flux_inner = _np.clip((1.0 - override_mix) * flux_inner + override_mix * flux_override, 0.0, 1.0)
         # --- END FLUX_SHAPE -----------------------------------------------------------
 
+        acc01 = normalize_unsigned01(_np.sqrt(ax_s*ax_s + ay_s*ay_s + az_s*az_s))
+        jerk01 = normalize_unsigned01(_np.sqrt(jx_s*jx_s + jy_s*jy_s + jz_s*jz_s))
         # Marker-driven Flux should also drive AoI / motion envelopes.
         # Otherwise Flux changes while the motion carrier stays mostly measured,
         # which feels unnaturally decoupled in manual-marker scenes.
@@ -11155,6 +11302,12 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             vy = _np.asarray(vy_s, _np.float64)
             vz = _np.asarray(vz_s, _np.float64)
 
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
             jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
@@ -12512,6 +12665,16 @@ def run_qt(video_path):
             vz_s = robust_smooth(vz, self.fps, win_ms=160, ema_tc_ms=240)
 
             dt = 1.0 / max(1e-6, float(self.fps))
+            fps = float(self.fps)
+            lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(int(ri), []), T, fill=False, dtype=bool)
+            curv = _fit_series_len(getattr(sc, "roi_curv", {}).get(int(ri), []), T, fill=0.0, dtype=_np.float64)
+            igdE = _fit_series_len(getattr(sc, "roi_igdE", {}).get(int(ri), []), T, fill=0.0, dtype=_np.float64)
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
             jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
@@ -12703,6 +12866,16 @@ def run_qt(video_path):
             vx_s = robust_smooth(vx, self.fps); vy_s = robust_smooth(vy, self.fps)
             vz_s = robust_smooth(vz, self.fps, win_ms=160, ema_tc_ms=240)
             dt = 1.0/max(1e-6, float(self.fps))
+            fps = float(self.fps)
+            lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(int(ri), []), len(vx_s), fill=False, dtype=bool)
+            curv = _fit_series_len(getattr(sc, "roi_curv", {}).get(int(ri), []), len(vx_s), fill=0.0, dtype=_np.float64)
+            igdE = _fit_series_len(getattr(sc, "roi_igdE", {}).get(int(ri), []), len(vx_s), fill=0.0, dtype=_np.float64)
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
             jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
             score, peaks = impact_score_and_peaks(vx_s,vy_s,vz_s, ax_s,ay_s,az_s, jx_s,jy_s,jz_s, self.fps,
@@ -12806,6 +12979,17 @@ def run_qt(video_path):
             px01, py01 = smooth_and_scale_xy(cx, cy, self.fps, up=3)
             vx_s = robust_smooth(vx, self.fps); vy_s = robust_smooth(vy, self.fps); vz_s = robust_smooth(vz, self.fps, win_ms=160, ema_tc_ms=240)
             dt = 1.0/max(1e-6, float(self.fps))
+            r = sc.rois[ri]
+            fps = float(self.fps)
+            lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(int(ri), []), T, fill=False, dtype=bool)
+            curv = _fit_series_len(getattr(sc, "roi_curv", {}).get(int(ri), []), T, fill=0.0, dtype=np.float64)
+            igdE = _fit_series_len(getattr(sc, "roi_igdE", {}).get(int(ri), []), T, fill=0.0, dtype=np.float64)
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
             jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
             score, peaks = impact_score_and_peaks(vx_s,vy_s,vz_s, ax_s,ay_s,az_s, jx_s,jy_s,jz_s,
@@ -12879,6 +13063,15 @@ def run_qt(video_path):
             vx_s = robust_smooth(vx, fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
             vy_s = robust_smooth(vy, fps, win_ms=140, ema_tc_ms=200, mad_k=3.6)
             vz_s = robust_smooth(vz, fps, win_ms=160, ema_tc_ms=240, mad_k=3.8)
+            lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(int(ri), []), T, fill=False, dtype=bool)
+            curv = _fit_series_len(getattr(sc, "roi_curv", {}).get(int(ri), []), T, fill=0.0, dtype=np.float64)
+            igdE = _fit_series_len(getattr(sc, "roi_igdE", {}).get(int(ri), []), T, fill=0.0, dtype=np.float64)
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
             jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
@@ -14302,6 +14495,16 @@ def run_qt(video_path):
 
                     # robust smooth on the window
                     vx_s = robust_smooth(vxw, self.fps); vy_s = robust_smooth(vyw, self.fps); vz_s = robust_smooth(vzw, self.fps, win_ms=160, ema_tc_ms=240)
+                    fps = float(self.fps)
+                    lowconf = _fit_series_len(getattr(sc, "roi_lowconf", {}).get(int(ri), [])[-len(vxw):], len(vxw), fill=False, dtype=bool)
+                    curv = _fit_series_len(getattr(sc, "roi_curv", {}).get(int(ri), [])[-len(vxw):], len(vxw), fill=0.0, dtype=np.float64)
+                    igdE = _fit_series_len(getattr(sc, "roi_igdE", {}).get(int(ri), [])[-len(vxw):], len(vxw), fill=0.0, dtype=np.float64)
+                    vx_s, vy_s, vz_s = condition_export_kinematics(
+                        vx_s, vy_s, vz_s, fps, rr,
+                        lowconf=lowconf,
+                        curv=curv,
+                        igdE=igdE,
+                    )
                     ax_s = _deriv_central(vx_s, dt); ay_s = _deriv_central(vy_s, dt); az_s = _deriv_central(vz_s, dt)
                     jx_s = _deriv_central(ax_s, dt); jy_s = _deriv_central(ay_s, dt); jz_s = _deriv_central(az_s, dt)
 
@@ -16391,6 +16594,12 @@ def run_qt(video_path):
             igdE = _fit_series_len(getattr(self.sc, "roi_igdE", {}).get(int(ri), []), self.T, fill=0.0, dtype=np.float64)
             lowconf = _fit_series_len(low_raw, self.T, fill=False, dtype=bool)
 
+            vx_s, vy_s, vz_s = condition_export_kinematics(
+                vx_s, vy_s, vz_s, fps, r,
+                lowconf=lowconf,
+                curv=curv,
+                igdE=igdE,
+            )
             kin = _semantic_motion_lanes(
                 vx_s, vy_s, vz_s, fps, r,
                 lowconf=lowconf,
@@ -16490,6 +16699,12 @@ def run_qt(video_path):
                     markers=markers,
                     force=True,
                     respect_marker_phase_sign=bool(respect_marker_phase_sign),
+                )
+                vx_mc, vy_mc, vz_mc = condition_export_kinematics(
+                    vx_mc, vy_mc, vz_mc, fps, r,
+                    lowconf=lowconf,
+                    curv=curv,
+                    igdE=igdE,
                 )
                 kin = _semantic_motion_lanes(
                     vx_mc, vy_mc, vz_mc, fps, r,
