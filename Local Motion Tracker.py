@@ -10400,7 +10400,10 @@ def write_midi_file(path: str, ppq: int, tracks: List[List[Tuple[int, bytes]]]) 
 def _cc_range_kind(col: str) -> str:
     """Return a hint for how to map this column into CC."""
     col = str(col)
-    if any(col.endswith(suf) for suf in ("_axis_v", "_axis_acc", "_axis_jerk", "_axis_dir",
+    if (not col.startswith("agg_")) and any(col.endswith(suf) for suf in ("_dirx01", "_diry01", "_dirz01")):
+        return "bipolar"
+    if any(col.endswith(suf) for suf in ("_dirx11", "_diry11", "_dirz11",
+                                        "_axis_v", "_axis_acc", "_axis_jerk", "_axis_dir",
                                         "_lat_v", "_lat_acc", "_lat_jerk", "_lat_dir",
                                         "_raise_v", "_raise_acc", "_raise_jerk", "_raise_dir",
                                         "_cam_log2_signed")):
@@ -10557,7 +10560,7 @@ def _resample_to_grid(t_src: np.ndarray, x_src: np.ndarray, t_grid: np.ndarray) 
     return np.interp(t_grid, t_src, x_src, left=x_src[0], right=x_src[-1])
 
 
-def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mapping_path: str,
+def write_legacy_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mapping_path: str,
                               bpm: float = 60.0, ppq: int = 960,
                               track_name_prefix: str = "ROI",
                               *,
@@ -10566,7 +10569,7 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
                               seek_eps_cc: int = MIDI_SEEK_EPS_CC,
                               time_zero_sec: Optional[float] = None) -> None:
 
-    """Write a MIDI file (and JSON mapping) from the local tracker export rows."""
+    """Legacy local MIDI exporter retained only for reference; canonical export is Receiver MX."""
     if not rows or "time" not in rows:
         return
     t = list(rows.get("time") or [])
@@ -10736,6 +10739,370 @@ def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mappi
     except Exception:
         pass
 
+
+
+# ============================== FluxBridge Receiver MX MIDI export ==============================
+# Emits a second MIDI file whose CC numbers match the Receiver MX base+offset layout.
+# This is separate from the generic local MIDI map above so existing workflows stay intact.
+
+RECEIVER_MX_CC_BASE_DEFAULT = 20
+
+_RECEIVER_MX_LAYOUT = [
+    ("env",           0,  "unipolar"),
+    ("dirx",          1,  "bipolar"),
+    ("diry",          2,  "bipolar"),
+    ("posx",          3,  "unipolar"),
+    ("posy",          4,  "unipolar"),
+    ("rigid_abs",     5,  "unipolar"),
+    ("rigid_rel",     6,  "unipolar"),
+    ("dirz",          7,  "bipolar"),
+    ("posz",          8,  "unipolar"),
+    ("speed",         9,  "unipolar"),
+    ("speed_z",       10, "unipolar"),
+    ("acc",           11, "unipolar"),
+    ("acc_z",         12, "unipolar"),
+    ("jerk",          13, "unipolar"),
+    ("jerk_z",        14, "unipolar"),
+    ("impact_in",     15, "unipolar"),
+    ("impact_out",    16, "unipolar"),
+    ("impact_score",  17, "unipolar"),
+    ("pan",           18, "unipolar"),
+    ("entropy",       19, "unipolar"),
+    ("axis_v",        20, "bipolar"),
+    ("axis_acc",      21, "bipolar"),
+    ("axis_jerk",     22, "bipolar"),
+    ("axis_dir",      23, "bipolar"),
+    ("lat_v",         24, "bipolar"),
+    ("lat_acc",       25, "bipolar"),
+    ("lat_jerk",      26, "bipolar"),
+    ("lat_dir",       27, "bipolar"),
+    ("lat_amp",       28, "unipolar"),
+    ("entropymotion", 29, "unipolar"),
+    ("entropylog2",   30, "unipolar"),
+    ("entropymeso",   31, "unipolar"),
+    ("entropymacro",  32, "unipolar"),
+    ("excitement",    33, "unipolar"),
+    ("activityratio", 34, "ratio4"),
+]
+
+_RECEIVER_MX_LABEL_COLS = {
+    "env": "flux_env",
+    "dirx": "dirx01",
+    "diry": "diry01",
+    "posx": "posx01",
+    "posy": "posy01",
+    "dirz": "dirz01",
+    "posz": "posz01",
+    "speed": "speed01",
+    "speed_z": "speed_z01",
+    "acc": "acc01",
+    "acc_z": "acc_z01",
+    "jerk": "jerk01",
+    "jerk_z": "jerk_z01",
+    "impact_in": "impact_in01",
+    "impact_out": "impact_out01",
+    "impact_score": "impact_score01",
+    "pan": "pan01",
+    "entropy": "entropy01",
+    "axis_v": "axis_v",
+    "axis_acc": "axis_acc",
+    "axis_jerk": "axis_jerk",
+    "axis_dir": "axis_dir",
+    "lat_v": "lat_v",
+    "lat_acc": "lat_acc",
+    "lat_jerk": "lat_jerk",
+    "lat_dir": "lat_dir",
+    "lat_amp": "lat_amp01",
+    "entropymotion": "entropy_micro01",
+    "entropylog2": "entropy_log201",
+    "entropymeso": "entropy_meso01",
+    "entropymacro": "entropy_macro01",
+    "excitement": "excitement_long01",
+    "activityratio": "activity_ratio",
+}
+
+_RECEIVER_MX_GLOBAL_COLS = {
+    "env": "flux_env",
+    "dirx": "agg_dirx11",
+    "diry": "agg_diry11",
+    "posx": "agg_posx01",
+    "posy": "agg_posy01",
+    "dirz": "agg_dirz11",
+    "posz": "agg_posz01",
+    "speed": "agg_speed01",
+    "speed_z": "agg_speed_z01",
+    "acc": "agg_acc01",
+    "acc_z": "agg_acc_z01",
+    "jerk": "agg_jerk01",
+    "jerk_z": "agg_jerk_z01",
+    "pan": "agg_pan01",
+    "entropy": "agg_entropy01",
+    "axis_v": "agg_axis_v",
+    "axis_acc": "agg_axis_acc",
+    "axis_jerk": "agg_axis_jerk",
+    "axis_dir": "agg_axis_dir",
+    "lat_v": "agg_lat_v",
+    "lat_acc": "agg_lat_acc",
+    "lat_jerk": "agg_lat_jerk",
+    "lat_dir": "agg_lat_dir",
+    "lat_amp": "agg_lat_amp01",
+    "entropymotion": "agg_entropy_micro01",
+    "entropylog2": "agg_entropy_log201",
+    "entropymeso": "agg_entropy_meso01",
+    "entropymacro": "agg_entropy_macro01",
+    "excitement": "agg_excitement_long01",
+    "activityratio": "agg_activity_ratio",
+}
+
+_RECEIVER_MX_DEFAULTS = {
+    "rigid_abs": 0.0,
+    "rigid_rel": 0.0,
+    "impact_in": 0.0,
+    "impact_out": 0.0,
+    "impact_score": 0.0,
+    "speed_z": 0.0,
+    "acc_z": 0.0,
+    "jerk_z": 0.0,
+    "pan": 0.5,
+}
+
+def _receiver_ratio_to_cc(x: float) -> int:
+    x = float(np.clip(float(x), 0.0, 4.0))
+    if x <= 1.0:
+        y = x * 63.0
+    else:
+        y = 64.0 + ((x - 1.0) / 3.0) * 63.0
+    return int(np.clip(np.floor(y + 0.5), 0, 127))
+
+def _receiver_to_cc_value(x: float, kind: str) -> int:
+    kind = str(kind)
+    if x is None:
+        return 0
+    try:
+        if math.isnan(float(x)):
+            return 0
+    except Exception:
+        pass
+    if kind == "ratio4":
+        return _receiver_ratio_to_cc(float(x))
+    if kind == "bipolar":
+        return _to_cc_value(float(x), "bipolar")
+    return _to_cc_value(float(x), "unipolar")
+
+def _fit_midi_series_len(seq: Optional[List[Any]], n: int, fill: float = 0.0) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, np.float64)
+    if not seq:
+        return np.full(n, float(fill), np.float64)
+    arr = np.asarray(list(seq), np.float64)
+    if arr.size < n:
+        arr = np.pad(arr, (0, n - arr.size), mode="edge")
+    if arr.size > n:
+        arr = arr[:n]
+    return arr
+
+def write_receiver_mx_midi_from_rows(rows: Dict[str, List[Any]],
+                                     midi_path: str,
+                                     mapping_path: str,
+                                     roi_labels: List[str],
+                                     bpm: float = 60.0,
+                                     ppq: int = 960,
+                                     *,
+                                     cc_base: int = RECEIVER_MX_CC_BASE_DEFAULT,
+                                     seek_safe: bool = MIDI_SEEK_SAFE_DEFAULT,
+                                     seek_hz: float = MIDI_SEEK_HZ_DEFAULT,
+                                     seek_eps_cc: int = MIDI_SEEK_EPS_CC,
+                                     time_zero_sec: Optional[float] = None) -> None:
+    """
+    Write a second MIDI file whose CC numbers match the FluxBridge Receiver MX
+    base+offset layout. Missing lanes are emitted as stable defaults at t=0 so
+    imported tracks start from a deterministic state.
+    """
+    if not rows or "time" not in rows:
+        return
+    t = list(rows.get("time") or [])
+    if not t:
+        return
+
+    if time_zero_sec is None:
+        t0 = float(t[0])
+    else:
+        t0 = float(time_zero_sec)
+
+    t_rel = np.asarray([float(tt) - t0 for tt in t], np.float64)
+    if t_rel.size <= 0:
+        return
+
+    seen = set()
+    unique_labels: List[str] = []
+    for lab in list(roi_labels or []):
+        if lab is None:
+            continue
+        lab = str(lab)
+        if not lab or lab in seen:
+            continue
+        seen.add(lab)
+        unique_labels.append(lab)
+
+    tempo_us = int(round(60_000_000.0 / float(bpm)))
+    meta_track = [
+        (0, _midi_meta(0x03, b"FluxBridge Receiver MX META")),
+        (0, _midi_meta(0x51, tempo_us.to_bytes(3, "big", signed=False))),
+        (0, _midi_meta(0x58, bytes([4, 2, 24, 8]))),
+    ]
+    tracks: List[List[Tuple[int, bytes]]] = [meta_track]
+    mapping = {
+        "tool": "receiver_mx",
+        "layout": "FluxBridge Receiver MX (18ch)",
+        "tempo_bpm": float(bpm),
+        "ppq": int(ppq),
+        "cc_base": int(cc_base),
+        "time_zero_sec": float(t0),
+        "tracks": [],
+    }
+
+    hz = float(max(1.0, seek_hz))
+    dt = 1.0 / hz
+    t_grid = np.arange(0.0, float(t_rel[-1]) + 0.5 * dt, dt, dtype=np.float64) if seek_safe else None
+    eps = int(max(1, int(seek_eps_cc)))
+
+    def _emit_track(track_name: str,
+                    channel: int,
+                    lane_cols: Dict[str, Optional[str]]) -> None:
+        evs: List[Tuple[int, bytes]] = []
+        evs.append((0, _midi_meta(0x03, track_name.encode("utf-8", errors="replace"))))
+        lane_info = []
+
+        for lane_name, lane_off, kind in _RECEIVER_MX_LAYOUT:
+            col = lane_cols.get(lane_name)
+            default_v = float(_RECEIVER_MX_DEFAULTS.get(lane_name, 0.0))
+            src = None
+            xs = None
+
+            if col and col in rows:
+                src = str(col)
+                seq = _fit_midi_series_len(rows.get(col), len(t_rel), fill=default_v)
+                if seek_safe:
+                    xs = _resample_to_grid(t_rel, seq, t_grid)
+                else:
+                    xs = seq
+            else:
+                xs = np.asarray([default_v], np.float64)
+
+            if xs is None or len(xs) <= 0:
+                xs = np.asarray([default_v], np.float64)
+
+            cc_num = int(cc_base) + int(lane_off)
+            v0 = _receiver_to_cc_value(float(xs[0]), kind)
+            evs.append((0, _midi_cc(channel, cc_num, v0)))
+            prev_val = v0
+
+            if seek_safe:
+                grid = t_grid if t_grid is not None else np.asarray([0.0], np.float64)
+                for i in range(1, len(grid)):
+                    v = _receiver_to_cc_value(float(xs[i]), kind)
+                    if abs(int(v) - int(prev_val)) >= eps:
+                        tick = int(round(float(grid[i]) * float(ppq)))
+                        evs.append((tick, _midi_cc(channel, cc_num, v)))
+                        prev_val = v
+            else:
+                for i in range(1, len(xs)):
+                    v = _receiver_to_cc_value(float(xs[i]), kind)
+                    if int(v) != int(prev_val):
+                        tick = int(round(float(t_rel[min(i, len(t_rel) - 1)]) * float(ppq)))
+                        evs.append((tick, _midi_cc(channel, cc_num, v)))
+                        prev_val = v
+
+            lane_info.append({
+                "lane": str(lane_name),
+                "cc": int(cc_num),
+                "kind": str(kind),
+                "column": src,
+                "default": None if src is not None else float(default_v),
+            })
+
+        tracks.append(evs)
+        mapping["tracks"].append({
+            "name": track_name,
+            "channel": int(channel),
+            "lanes": lane_info,
+        })
+
+    _emit_track("ReceiverMX:GLOBAL", channel=0, lane_cols=dict(_RECEIVER_MX_GLOBAL_COLS))
+
+    for ti, label in enumerate(unique_labels):
+        lane_cols = {lane: (f"{label}_{suffix}" if suffix is not None else None)
+                     for lane, suffix in _RECEIVER_MX_LABEL_COLS.items()}
+        ch = (ti + 1) % 16
+        _emit_track(f"ReceiverMX:{label}", channel=ch, lane_cols=lane_cols)
+
+    write_midi_file(midi_path, ppq=int(ppq), tracks=tracks)
+
+    try:
+        with open(mapping_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2)
+    except Exception:
+        pass
+
+
+
+def _infer_receiver_mx_labels_from_rows(rows: Dict[str, List[Any]]) -> List[str]:
+    """Infer per-label track names from exported row keys for Receiver MX export."""
+    if not rows:
+        return []
+
+    labels: List[str] = []
+    seen = set()
+    suffixes = sorted(
+        [s for s in _RECEIVER_MX_LABEL_COLS.values() if s],
+        key=len,
+        reverse=True,
+    )
+
+    for col in rows.keys():
+        if col == "time" or col.startswith("agg_") or col == "flux_env":
+            continue
+        for suf in suffixes:
+            tok = "_" + str(suf)
+            if col.endswith(tok):
+                label = col[:-len(tok)]
+                if label and label not in seen:
+                    seen.add(label)
+                    labels.append(label)
+                break
+    return labels
+
+
+def write_local_midi_from_rows(rows: Dict[str, List[Any]], midi_path: str, mapping_path: str,
+                              bpm: float = 60.0, ppq: int = 960,
+                              track_name_prefix: str = "ROI",
+                              *,
+                              roi_labels: Optional[List[str]] = None,
+                              cc_base: int = RECEIVER_MX_CC_BASE_DEFAULT,
+                              seek_safe: bool = MIDI_SEEK_SAFE_DEFAULT,
+                              seek_hz: float = MIDI_SEEK_HZ_DEFAULT,
+                              seek_eps_cc: int = MIDI_SEEK_EPS_CC,
+                              time_zero_sec: Optional[float] = None) -> None:
+    """Canonical MIDI exporter: FluxBridge Receiver MX layout only."""
+    labels = [str(lab) for lab in (roi_labels or []) if str(lab)]
+    if not labels:
+        labels = _infer_receiver_mx_labels_from_rows(rows)
+
+    write_receiver_mx_midi_from_rows(
+        rows,
+        midi_path,
+        mapping_path,
+        roi_labels=labels,
+        bpm=float(bpm),
+        ppq=int(ppq),
+        cc_base=int(cc_base),
+        seek_safe=bool(seek_safe),
+        seek_hz=float(seek_hz),
+        seek_eps_cc=int(seek_eps_cc),
+        time_zero_sec=time_zero_sec,
+    )
+
+
 def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, robust_gamma=1.0, push=True, export_motion: str = 'live', export_live_lp_hz: float = 0.0, export_live_deadband_ps: float = 0.0, phase_markers_by_roi: Optional[Dict[int, List[Dict[str, Any]]]] = None, hard_write_flux_aoi: bool = False, flux_measured_bleed: float = 0.15, flux_pretty_mix: float = 1.0, flux_onset_snap: float = 0.0, flux_override_enable: bool = False, flux_override_mix: float = FLUX_OVERRIDE_MIX_DEFAULT, flux_override_floor: float = FLUX_OVERRIDE_FLOOR_DEFAULT, flux_override_floor_rand: float = FLUX_OVERRIDE_FLOOR_RAND_DEFAULT, flux_override_peak_rand: float = FLUX_OVERRIDE_PEAK_RAND_DEFAULT):
     """
     CSV export that matches export_fullpass overlay policy EXACTLY for impacts:
@@ -10780,6 +11147,9 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
 
     rows = dict(time=list(sc.times))
     agg_cx=[]; agg_cy=[]; agg_vx=[]; agg_vy=[]; agg_vz=[]; agg_pz=[]
+    agg_axis_v=[]; agg_axis_acc=[]; agg_axis_jerk=[]; agg_axis_dir=[]
+    agg_lat_v=[]; agg_lat_acc=[]; agg_lat_jerk=[]; agg_lat_dir=[]; agg_lat_amp=[]
+    agg_speed_z=[]; agg_acc_z=[]; agg_jerk_z=[]; agg_curv=[]; agg_pan=[]
     roi_labels=[]
 
     label_mode = getattr(sc, 'label_mode', 'per_roi')
@@ -11412,10 +11782,15 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             rows[f"{label}_posz01"]   = posz01_s.tolist()
 
             rows[f"{label}_speed01"]  = normalize_unsigned01(speed_s).tolist()
+            rows[f"{label}_speed_z01"] = normalize_unsigned01(_np.abs(vz_s)).tolist()
             rows[f"{label}_acc01"]    = acc01.tolist()
+            rows[f"{label}_acc_z01"]  = normalize_unsigned01(_np.abs(az_s)).tolist()
             rows[f"{label}_jerk01"]   = jerk01.tolist()
+            rows[f"{label}_jerk_z01"] = normalize_unsigned01(_np.abs(jz_s)).tolist()
 
             rows[f"{label}_entropy01"] = entropy_roi.tolist()
+            rows[f"{label}_entropy_log201"] = curv01.tolist()
+            rows[f"{label}_pan01"] = posx01_s.tolist()
 
             # NEW: principal-axis AoI lanes (SIGNED, -1..+1)
             rows[f"{label}_axis_v"]    = axis_v11.tolist()
@@ -11651,6 +12026,13 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         agg_cx.append(cx); agg_cy.append(cy)
         agg_vx.append(vx); agg_vy.append(vy); agg_vz.append(vz)
         agg_pz.append(leaky_integrate(vz_s, dt, tau_ms=int(getattr(r, 'posz_tau_ms', 800))))
+        agg_axis_v.append(axis_v11); agg_axis_acc.append(axis_acc11); agg_axis_jerk.append(axis_jerk11); agg_axis_dir.append(axis_dir11)
+        agg_lat_v.append(lat_v11); agg_lat_acc.append(lat_acc11); agg_lat_jerk.append(lat_jerk11); agg_lat_dir.append(lat_dir11); agg_lat_amp.append(lat_amp01)
+        agg_speed_z.append(normalize_unsigned01(_np.abs(vz_s)))
+        agg_acc_z.append(normalize_unsigned01(_np.abs(az_s)))
+        agg_jerk_z.append(normalize_unsigned01(_np.abs(jz_s)))
+        agg_curv.append(curv01)
+        agg_pan.append(posx01_s)
 
     # --- ROI-local multiscale lanes + pooled local-scene context ---
     if roi_metric_cache:
@@ -11760,6 +12142,28 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         cxm = _np.zeros(T); cym = _np.zeros(T)
         vxm = _np.zeros(T); vym = _np.zeros(T); vzm = _np.zeros(T); pzm = _np.zeros(T)
 
+    def _agg_mean_or_zero(seq_list, default: float = 0.0):
+        if seq_list:
+            return _np.mean(_np.vstack(seq_list), axis=0)
+        return _np.full(T, float(default), _np.float64)
+
+    axis_vm = _agg_mean_or_zero(agg_axis_v)
+    axis_accm = _agg_mean_or_zero(agg_axis_acc)
+    axis_jerkm = _agg_mean_or_zero(agg_axis_jerk)
+    axis_dirm = _agg_mean_or_zero(agg_axis_dir)
+
+    lat_vm = _agg_mean_or_zero(agg_lat_v)
+    lat_accm = _agg_mean_or_zero(agg_lat_acc)
+    lat_jerkm = _agg_mean_or_zero(agg_lat_jerk)
+    lat_dirm = _agg_mean_or_zero(agg_lat_dir)
+    lat_ampm = _agg_mean_or_zero(agg_lat_amp)
+
+    speed_zm = _agg_mean_or_zero(agg_speed_z)
+    acc_zm = _agg_mean_or_zero(agg_acc_z)
+    jerk_zm = _agg_mean_or_zero(agg_jerk_z)
+    curvm = _agg_mean_or_zero(agg_curv)
+    panm = _agg_mean_or_zero(agg_pan, default=0.5)
+
     rows["agg_posx01"] = _np.clip(cxm/float(W), 0.0, 1.0).tolist()
     rows["agg_posy01"] = _np.clip(cym/float(H), 0.0, 1.0).tolist()
     rows["agg_posz01"] = _dir01(pzm, 1.0).tolist()
@@ -11771,10 +12175,13 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
     rows["agg_dirx01"] = ((normalize_signed11(vxm_s)*0.5)+0.5).tolist()
     rows["agg_diry01"] = ((normalize_signed11(vym_s)*0.5)+0.5).tolist()
     rows["agg_dirz01"] = ((normalize_signed11(vzm_s)*0.5)+0.5).tolist()
+    rows["agg_dirx11"] = normalize_signed11(vxm_s).tolist()
+    rows["agg_diry11"] = normalize_signed11(vym_s).tolist()
+    rows["agg_dirz11"] = normalize_signed11(vzm_s).tolist()
 
     dt = 1.0/max(1e-6, float(fps))
     axm_s = _deriv_central(vxm_s, dt); aym_s = _deriv_central(vym_s, dt); azm_s = _deriv_central(vzm_s, dt)
-    jzm_s = _deriv_central(azm_s, dt)
+    jxm_s = _deriv_central(axm_s, dt); jym_s = _deriv_central(aym_s, dt); jzm_s = _deriv_central(azm_s, dt)
 
     rows["agg_velx01"] = _dir01(vxm_s, 1.0).tolist()
     rows["agg_vely01"] = _dir01(vym_s, 1.0).tolist()
@@ -11783,6 +12190,27 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
     rows["agg_accy01"] = _dir01(aym_s, 1.0).tolist()
     rows["agg_accz01"] = _dir01(azm_s, 1.0).tolist()
     rows["agg_jerkz01"] = _dir01(jzm_s, 1.0).tolist()
+
+    rows["agg_speed01"] = normalize_unsigned01(_np.sqrt(vxm_s*vxm_s + vym_s*vym_s + vzm_s*vzm_s)).tolist()
+    rows["agg_speed_z01"] = normalize_unsigned01(_np.abs(vzm_s)).tolist()
+    rows["agg_acc01"] = normalize_unsigned01(_np.sqrt(axm_s*axm_s + aym_s*aym_s + azm_s*azm_s)).tolist()
+    rows["agg_acc_z01"] = normalize_unsigned01(_np.abs(azm_s)).tolist()
+    rows["agg_jerk01"] = normalize_unsigned01(_np.sqrt(jxm_s*jxm_s + jym_s*jym_s + jzm_s*jzm_s)).tolist()
+    rows["agg_jerk_z01"] = normalize_unsigned01(_np.abs(jzm_s)).tolist()
+    rows["agg_pan01"] = _np.clip(panm, 0.0, 1.0).tolist()
+
+    rows["agg_axis_v"] = axis_vm.tolist()
+    rows["agg_axis_acc"] = axis_accm.tolist()
+    rows["agg_axis_jerk"] = axis_jerkm.tolist()
+    rows["agg_axis_dir"] = axis_dirm.tolist()
+
+    rows["agg_lat_v"] = lat_vm.tolist()
+    rows["agg_lat_acc"] = lat_accm.tolist()
+    rows["agg_lat_jerk"] = lat_jerkm.tolist()
+    rows["agg_lat_dir"] = lat_dirm.tolist()
+    rows["agg_lat_amp01"] = _np.clip(lat_ampm, 0.0, 1.0).tolist()
+
+    rows["agg_entropy_log201"] = _robust01(_np.abs(curvm), p_lo=5, p_hi=95).tolist()
 
     flux_env_raw = _np.sqrt(vxm_s*vxm_s + vym_s*vym_s + vzm_s*vzm_s)
     rows["flux_env"] = _np.clip(_envelope(flux_env_raw, fps) /
@@ -11826,22 +12254,24 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
     os.replace(tmp, csv_path)
     print(f"[export] wrote {csv_path}")
 
-    # MIDI export (DAW-agnostic): one track per ROI label + GLOBAL.
+    # MIDI export: FluxBridge Receiver MX layout only.
     try:
         midi_path = os.path.splitext(csv_path)[0] + ".mid"
         map_path  = os.path.splitext(csv_path)[0] + ".midi_map.json"
         write_local_midi_from_rows(
             rows, midi_path, map_path,
             bpm=60.0, ppq=960,
+            roi_labels=roi_labels,
+            cc_base=RECEIVER_MX_CC_BASE_DEFAULT,
             seek_safe=True,
             seek_hz=24.0,
             seek_eps_cc=1,
-            time_zero_sec=0.0,   # <-- makes the MIDI time absolute-to-video/project
+            time_zero_sec=0.0,   # absolute-to-video/project
         )
 
         print(f"[export] wrote {midi_path}")
     except Exception as e:
-        print(f"[midi] export failed: {e}")
+        print(f"[midi:receiver_mx] export failed: {e}")
 
     if push:
 
@@ -15705,7 +16135,34 @@ def run_qt(video_path):
                      fps: float, W: int, H: int, *, sc_src: Optional[Scene] = None):
             super().__init__(parent)
             self.setWindowTitle(f"Preview Envelopes — Scene {scene_id}")
-            self.resize(1040, 720)
+
+            # Keep the dialog comfortably inside the visible screen area.
+            # The previous version could size the client area almost as large as the
+            # available screen and then rely on Qt's default placement, which can push
+            # the native title bar off-screen once window-frame decorations are added.
+            self._dlg_screen_margin = 20
+            self._dlg_frame_guard_h = 56
+            self._dlg_initial_place_done = False
+            self._dlg_fit_pending = False
+            self._dlg_fit_anchor_topleft = False
+            self._dlg_wayland = self._is_wayland_backend()
+            self._dlg_last_screen = None
+            self._dlg_screen_hooks_installed = False
+            self._dlg_fit_timer = QtCore.QTimer(self)
+            self._dlg_fit_timer.setSingleShot(True)
+            self._dlg_fit_timer.timeout.connect(self._apply_queued_dialog_screen_fit)
+
+            dlg_w, dlg_h = 1040, 720
+            try:
+                geo = self._screen_available_geometry()
+                if geo is not None:
+                    max_w = max(480, int(geo.width()) - 2 * int(self._dlg_screen_margin))
+                    max_h = max(360, int(geo.height()) - 2 * int(self._dlg_screen_margin) - int(self._dlg_frame_guard_h))
+                    dlg_w = min(max(1040, int(round(geo.width() * 0.90))), max_w)
+                    dlg_h = min(max(720, int(round(geo.height() * 0.84))), max_h)
+            except Exception:
+                pass
+            self.resize(int(max(480, dlg_w)), int(max(360, dlg_h)))
 
             self.video_path = str(video_path)
             self.scene_id = int(scene_id)
@@ -15725,6 +16182,11 @@ def run_qt(video_path):
             self._pvH = max(64, int(round(self.H * self._pv_scale)))
             self._pv_sx = self._pvW / float(self.W) if self.W else 1.0
             self._pv_sy = self._pvH / float(self.H) if self.H else 1.0
+
+            # Display-side upscale: keep decode small for scrubbing speed, but stretch the
+            # preview in the UI so it occupies the top-left quarter of the screen when space exists.
+            self._pv_display_frac_w = 0.50
+            self._pv_display_frac_h = 0.50
 
             # LRU cache: frame_idx -> BGR image at preview size
             self._pv_cache = OrderedDict()
@@ -15816,11 +16278,21 @@ def run_qt(video_path):
             left = QtWidgets.QVBoxLayout()
             split.addLayout(left, 2)
 
+            self.preview_host = QtWidgets.QWidget()
+            self.preview_host.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            self.preview_host.setStyleSheet("background: #111; border: 1px solid #333;")
+
+            preview_host_layout = QtWidgets.QVBoxLayout(self.preview_host)
+            preview_host_layout.setContentsMargins(0, 0, 0, 0)
+            preview_host_layout.setSpacing(0)
+
             self.lbl_frame = QtWidgets.QLabel()
-            self.lbl_frame.setFixedSize(self._pvW, self._pvH)   # fixed = no per-frame Qt scaling
-            self.lbl_frame.setAlignment(QtCore.Qt.AlignCenter)
-            self.lbl_frame.setStyleSheet("background: #111; border: 1px solid #333;")
-            left.addWidget(self.lbl_frame, 5)
+            self.lbl_frame.setMinimumSize(self._pvW, self._pvH)
+            self.lbl_frame.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            self.lbl_frame.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            self.lbl_frame.setStyleSheet("background: #111; border: 0;")
+            preview_host_layout.addWidget(self.lbl_frame, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            left.addWidget(self.preview_host, 9)
 
             # scrub controls
             scrub = QtWidgets.QHBoxLayout()
@@ -15844,14 +16316,16 @@ def run_qt(video_path):
             self.plot_axis = _Sparkline("AoI thrust v (−1..+1)", -1.0, 1.0)
             self.plot_lat  = _Sparkline("Depth sway / Z amp (0..1)", 0.0, 1.0)
             self.plot_raise = _Sparkline("Raise / Y amp (0..1)", 0.0, 1.0)
-            left.addWidget(self.plot_flux, 2)
-            left.addWidget(self.plot_axis, 2)
-            left.addWidget(self.plot_lat,  2)
-            left.addWidget(self.plot_raise, 2)
+            left.addWidget(self.plot_flux, 1)
+            left.addWidget(self.plot_axis, 1)
+            left.addWidget(self.plot_lat,  1)
+            left.addWidget(self.plot_raise, 1)
 
             # RIGHT: marker table + tools
             right = QtWidgets.QVBoxLayout()
             split.addLayout(right, 2)
+            split.setStretch(0, 3)
+            split.setStretch(1, 2)
 
             self.tbl = QtWidgets.QTableWidget()
             self.tbl.setColumnCount(4)
@@ -16153,6 +16627,7 @@ def run_qt(video_path):
 
 
             # init view
+            QtCore.QTimer.singleShot(0, self._update_preview_display_size)
             self._on_roi_changed()
 
         # ---------------- data init ----------------
@@ -17021,9 +17496,316 @@ def run_qt(video_path):
                     bpl = int(rgb.strides[0])
                     qimg = QtGui.QImage(rgb.data, w, h, bpl, self._qt_fmt_rgb)
 
-                self.lbl_frame.setPixmap(QtGui.QPixmap.fromImage(qimg))
+                pix = QtGui.QPixmap.fromImage(qimg)
+                tgt = self.lbl_frame.size()
+                if tgt.width() > 0 and tgt.height() > 0:
+                    pix = pix.scaled(tgt, QtCore.Qt.KeepAspectRatio, QtCore.Qt.FastTransformation)
+                self.lbl_frame.setPixmap(pix)
             except Exception:
                 self.lbl_frame.setText("(render failed)")
+
+        def _is_wayland_backend(self):
+            try:
+                qga = getattr(QtGui, "QGuiApplication", None)
+                if qga is not None:
+                    nm = str(qga.platformName() or "").lower()
+                    if "wayland" in nm:
+                        return True
+            except Exception:
+                pass
+            try:
+                if "wayland" in str(os.environ.get("QT_QPA_PLATFORM", "") or "").lower():
+                    return True
+            except Exception:
+                pass
+            try:
+                if "wayland" in str(os.environ.get("XDG_SESSION_TYPE", "") or "").lower():
+                    return True
+            except Exception:
+                pass
+            try:
+                if os.environ.get("WAYLAND_DISPLAY"):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _ensure_dialog_window_hooks(self):
+            if bool(getattr(self, "_dlg_screen_hooks_installed", False)):
+                return
+            try:
+                wh = self.windowHandle()
+            except Exception:
+                wh = None
+            if wh is None:
+                return
+            self._dlg_screen_hooks_installed = True
+            try:
+                scr = wh.screen()
+                if scr is not None:
+                    self._dlg_last_screen = scr
+            except Exception:
+                pass
+            try:
+                wh.screenChanged.connect(self._on_dialog_screen_changed)
+            except Exception:
+                pass
+
+        def _on_dialog_screen_changed(self, scr):
+            try:
+                if scr is not None:
+                    self._dlg_last_screen = scr
+            except Exception:
+                pass
+            self._update_preview_display_size()
+            self._queue_dialog_screen_fit(anchor_top_left=False, delay_ms=(180 if self._dlg_wayland else 0))
+
+        def _dialog_geometry_locked_by_compositor(self):
+            try:
+                if self.isFullScreen() or self.isMaximized():
+                    return True
+            except Exception:
+                pass
+            try:
+                st = int(self.windowState())
+                q = QtCore.Qt
+                maximized = int(getattr(q, "WindowMaximized", 0))
+                fullscreen = int(getattr(q, "WindowFullScreen", 0))
+                if (st & maximized) or (st & fullscreen):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _screen_available_geometry(self):
+            try:
+                scr = getattr(self, "_dlg_last_screen", None)
+            except Exception:
+                scr = None
+            try:
+                if scr is None:
+                    wh = self.windowHandle()
+                    scr = wh.screen() if wh is not None else None
+            except Exception:
+                pass
+            try:
+                if scr is None:
+                    scr = self.screen()
+            except Exception:
+                pass
+            try:
+                if scr is None:
+                    pw = self.parentWidget()
+                    scr = pw.screen() if pw is not None else None
+            except Exception:
+                pass
+            try:
+                if scr is None:
+                    qga = getattr(QtGui, "QGuiApplication", None)
+                    if qga is not None and hasattr(qga, "screenAt"):
+                        scr = qga.screenAt(QtGui.QCursor.pos())
+            except Exception:
+                pass
+            try:
+                if scr is None:
+                    scr = QtWidgets.QApplication.primaryScreen()
+                if scr is not None:
+                    return scr.availableGeometry()
+            except Exception:
+                pass
+            return None
+
+        def _apply_dialog_screen_limits(self):
+            geo = self._screen_available_geometry()
+            if geo is None:
+                return
+            margin = int(max(8, int(getattr(self, "_dlg_screen_margin", 20) or 20)))
+            frame_guard_h = int(max(0, int(getattr(self, "_dlg_frame_guard_h", 56) or 56)))
+            max_w = max(480, int(geo.width()) - 2 * margin)
+            max_h = max(360, int(geo.height()) - 2 * margin - frame_guard_h)
+            try:
+                self.setMinimumSize(480, 360)
+            except Exception:
+                pass
+            try:
+                self.setMaximumSize(int(max_w), int(max_h))
+            except Exception:
+                pass
+
+        def _clamp_dialog_to_screen(self, *, anchor_top_left: bool = False):
+            geo = self._screen_available_geometry()
+            if geo is None:
+                return
+
+            self._apply_dialog_screen_limits()
+            if self._dialog_geometry_locked_by_compositor():
+                return
+
+            margin = int(max(8, int(getattr(self, "_dlg_screen_margin", 20) or 20)))
+            frame_guard_h = int(max(0, int(getattr(self, "_dlg_frame_guard_h", 56) or 56)))
+
+            max_w = max(480, int(geo.width()) - 2 * margin)
+            max_h = max(360, int(geo.height()) - 2 * margin - frame_guard_h)
+            new_w = min(int(self.width()), max_w)
+            new_h = min(int(self.height()), max_h)
+            if new_w != int(self.width()) or new_h != int(self.height()):
+                self.resize(new_w, new_h)
+
+            try:
+                frame = self.frameGeometry()
+                frame_w = max(int(frame.width()), int(self.width()))
+                frame_h = max(int(frame.height()), int(self.height()))
+                cur_x = int(frame.x())
+                cur_y = int(frame.y())
+            except Exception:
+                frame_w = int(self.width())
+                frame_h = int(self.height())
+                cur_x = int(self.x())
+                cur_y = int(self.y())
+
+            min_x = int(geo.left()) + margin
+            min_y = int(geo.top()) + margin
+            max_x = int(geo.right()) - margin - frame_w + 1
+            max_y = int(geo.bottom()) - margin - frame_h + 1
+            if max_x < min_x:
+                max_x = min_x
+            if max_y < min_y:
+                max_y = min_y
+
+            if anchor_top_left:
+                new_x = min_x
+                new_y = min_y
+            else:
+                new_x = min(max(cur_x, min_x), max_x)
+                new_y = min(max(cur_y, min_y), max_y)
+
+            try:
+                self.move(int(new_x), int(new_y))
+            except Exception:
+                pass
+
+        def _apply_queued_dialog_screen_fit(self):
+            self._dlg_fit_pending = False
+            anchor = bool(getattr(self, "_dlg_fit_anchor_topleft", False))
+            self._dlg_fit_anchor_topleft = False
+            self._ensure_dialog_window_hooks()
+            self._update_preview_display_size()
+            self._apply_dialog_screen_limits()
+            if not self._dialog_geometry_locked_by_compositor():
+                self._clamp_dialog_to_screen(anchor_top_left=anchor)
+            if anchor:
+                self._dlg_initial_place_done = True
+            self._update_preview_display_size()
+
+        def _queue_dialog_screen_fit(self, *, anchor_top_left: bool = False, delay_ms: Optional[int] = None):
+            want_anchor = bool(anchor_top_left)
+            self._dlg_fit_pending = True
+            if want_anchor:
+                self._dlg_fit_anchor_topleft = True
+
+            if delay_ms is None:
+                if want_anchor:
+                    delay_ms = 0
+                else:
+                    delay_ms = 140 if bool(getattr(self, "_dlg_wayland", False)) else 0
+
+            delay_ms = int(max(0, delay_ms))
+            try:
+                self._dlg_fit_timer.start(delay_ms)
+            except Exception:
+                def _apply():
+                    self._apply_queued_dialog_screen_fit()
+                QtCore.QTimer.singleShot(delay_ms, _apply)
+
+        def _preview_target_size(self):
+            src_w = int(max(1, self._pvW))
+            src_h = int(max(1, self._pvH))
+
+            host_w = src_w
+            host_h = src_h
+            try:
+                host = getattr(self, "preview_host", None)
+                if host is not None:
+                    rect = host.contentsRect()
+                    host_w = max(src_w, int(rect.width()))
+                    host_h = max(src_h, int(rect.height()))
+            except Exception:
+                pass
+
+            geo = self._screen_available_geometry()
+            if geo is not None:
+                quad_w = max(src_w, int(round(float(geo.width()) * float(self._pv_display_frac_w))))
+                quad_h = max(src_h, int(round(float(geo.height()) * float(self._pv_display_frac_h))))
+                host_w = min(host_w, quad_w)
+                host_h = min(host_h, quad_h)
+
+            qsz = QtCore.QSize(int(host_w), int(host_h))
+            src = QtCore.QSize(src_w, src_h)
+            src.scale(qsz, QtCore.Qt.KeepAspectRatio)
+            return src
+
+        def _update_preview_display_size(self):
+            try:
+                tgt = self._preview_target_size()
+                self.lbl_frame.setFixedSize(tgt)
+            except Exception:
+                return
+
+            vis = getattr(self, "_pv_last_vis", None)
+            if vis is not None:
+                try:
+                    h, w = vis.shape[:2]
+                    bpl = int(vis.strides[0])
+                    if getattr(self, "_qt_fmt_bgr", None) is not None:
+                        qimg = QtGui.QImage(vis.data, w, h, bpl, self._qt_fmt_bgr)
+                    else:
+                        rgb = cv.cvtColor(vis, cv.COLOR_BGR2RGB)
+                        self._pv_last_vis = rgb
+                        h, w = rgb.shape[:2]
+                        bpl = int(rgb.strides[0])
+                        qimg = QtGui.QImage(rgb.data, w, h, bpl, self._qt_fmt_rgb)
+                    pix = QtGui.QPixmap.fromImage(qimg)
+                    pix = pix.scaled(self.lbl_frame.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.FastTransformation)
+                    self.lbl_frame.setPixmap(pix)
+                except Exception:
+                    pass
+
+        def resizeEvent(self, ev):
+            try:
+                super().resizeEvent(ev)
+            finally:
+                self._ensure_dialog_window_hooks()
+                self._update_preview_display_size()
+                if self.isVisible() and (not bool(getattr(self, "_dlg_wayland", False))):
+                    self._queue_dialog_screen_fit(anchor_top_left=False, delay_ms=0)
+
+        def moveEvent(self, ev):
+            try:
+                super().moveEvent(ev)
+            finally:
+                self._ensure_dialog_window_hooks()
+                if self.isVisible():
+                    self._queue_dialog_screen_fit(anchor_top_left=False, delay_ms=(180 if self._dlg_wayland else 40))
+
+        def changeEvent(self, ev):
+            try:
+                super().changeEvent(ev)
+            finally:
+                try:
+                    if ev.type() == QtCore.QEvent.WindowStateChange:
+                        self._queue_dialog_screen_fit(anchor_top_left=False, delay_ms=(220 if self._dlg_wayland else 0))
+                except Exception:
+                    pass
+
+        def showEvent(self, ev):
+            try:
+                super().showEvent(ev)
+            finally:
+                self._ensure_dialog_window_hooks()
+                self._queue_dialog_screen_fit(
+                    anchor_top_left=not bool(getattr(self, "_dlg_initial_place_done", False)),
+                    delay_ms=(60 if self._dlg_wayland else 0),
+                )
 
         def _on_slider_pressed(self):
             self._pv_dragging = True
