@@ -3538,6 +3538,234 @@ PRETTY_FLUX_MIX               = 1.0
 # Tiny cosmetic blur to remove stairsteps (seconds). Keep small.
 PRETTY_FLUX_POST_BLUR_SEC     = 0.020
 
+# --- Manual marker continuation + depth -------------------------------------
+# Marker fields carried through preview/export:
+#   kind:  "IN" | "OUT"
+#   cont:  True means continuation/hold marker, not a new impact spike
+#   depth: physical insertion depth in [0,1] at/after this marker
+#          1.0 = full IN, 0.0 = full OUT, 0.5 = half depth
+# Plain wheel edits the selected/current marker depth.
+# Shift+wheel offsets every marker of that IN/OUT class, preserving explicit
+# per-marker offsets until clamped. Repeated Shift+wheel naturally normalizes
+# the class to 0% or 100%.
+MARKER_DEPTH_DEFAULT_IN       = 1.0
+MARKER_DEPTH_DEFAULT_OUT      = 0.0
+MARKER_DEPTH_STEP             = 0.05
+MARKER_DEPTH_TRANSITION_MS    = 70.0
+MARKER_DEPTH_MOTION_BLUR_SEC  = 0.018
+
+
+def _marker_kind(m) -> str:
+    try:
+        k = str(m.get("kind", "IN") or "IN").upper()
+    except Exception:
+        k = "IN"
+    return "OUT" if k.startswith("O") else "IN"
+
+
+def _marker_is_continuation(m) -> bool:
+    try:
+        return bool(m.get("cont", False) or m.get("continuation", False) or m.get("is_continuation", False))
+    except Exception:
+        return False
+
+
+def _marker_default_depth(kind: str) -> float:
+    return float(MARKER_DEPTH_DEFAULT_OUT if str(kind).upper().startswith("O") else MARKER_DEPTH_DEFAULT_IN)
+
+
+def _marker_depth_value(m, kind: Optional[str] = None) -> float:
+    if kind is None:
+        kind = _marker_kind(m)
+    for key in ("depth", "depth01", "depth_pct"):
+        if isinstance(m, dict) and key in m:
+            try:
+                v = float(m.get(key))
+                if key == "depth_pct":
+                    v /= 100.0
+                return float(np.clip(v, 0.0, 1.0))
+            except Exception:
+                pass
+    return _marker_default_depth(kind)
+
+
+def _marker_depth_is_explicit(m) -> bool:
+    try:
+        return bool(m.get("depth_explicit", False) or m.get("depth_locked", False))
+    except Exception:
+        return False
+
+
+def _marker_has_depth_info(markers) -> bool:
+    """True when marker data contains continuation/depth intent beyond legacy IN/OUT spikes."""
+    for m in (markers or []):
+        if not isinstance(m, dict):
+            continue
+        if _marker_is_continuation(m):
+            return True
+        if any(k in m for k in ("depth", "depth01", "depth_pct", "depth_explicit", "depth_locked")):
+            return True
+    return False
+
+
+def _sanitize_marker_records(T: int, markers, *, keep_same_kind: bool = True) -> List[Dict[str, Any]]:
+    """Clamp/sort marker dicts while preserving continuation/depth metadata."""
+    T = int(max(0, T))
+    out: List[Dict[str, Any]] = []
+    if T <= 0:
+        return out
+    for m in (markers or []):
+        if not isinstance(m, dict):
+            continue
+        try:
+            idx = int(np.clip(int(m.get("idx", -1)), 0, T - 1))
+        except Exception:
+            continue
+        kind = _marker_kind(m)
+        src_idx = m.get("src_idx", None)
+        if src_idx is not None:
+            try:
+                src_idx = float(src_idx)
+            except Exception:
+                src_idx = None
+        rec = {
+            "idx": int(idx),
+            "kind": kind,
+            "src_idx": src_idx,
+            "cont": bool(_marker_is_continuation(m)),
+            "depth": float(_marker_depth_value(m, kind)),
+            "depth_explicit": bool(_marker_depth_is_explicit(m)),
+        }
+        if "id" in m:
+            try:
+                rec["id"] = int(m.get("id"))
+            except Exception:
+                pass
+        out.append(rec)
+
+    out.sort(key=lambda z: int(z.get("idx", 0)))
+
+    # Same-sample collisions: OUT wins; otherwise the later record wins so a fresh edit replaces old metadata.
+    ded: List[Dict[str, Any]] = []
+    for m in out:
+        if ded and int(m["idx"]) == int(ded[-1]["idx"]):
+            if m["kind"] == "OUT" or ded[-1]["kind"] != "OUT":
+                ded[-1] = m
+            continue
+        ded.append(m)
+
+    if keep_same_kind:
+        return ded
+
+    # Legacy collapse mode, but never delete continuation or explicit-depth anchors.
+    collapsed: List[Dict[str, Any]] = []
+    for m in ded:
+        protected = bool(m.get("cont", False) or m.get("depth_explicit", False))
+        if collapsed and m["kind"] == collapsed[-1]["kind"] and not protected:
+            continue
+        collapsed.append(m)
+    return collapsed
+
+
+def marker_depth_envelope01(
+    T: int,
+    markers,
+    fps: float = 30.0,
+    *,
+    transition_ms: float = MARKER_DEPTH_TRANSITION_MS,
+) -> np.ndarray:
+    """
+    Physical depth envelope from manual IN/OUT markers.
+
+    Normal markers start a short local transition from the current depth to the
+    marker depth. Continuation markers are hold anchors: they update/confirm the
+    depth at that sample without interpolating motion through the preceding span.
+    """
+    T = int(max(0, T))
+    out = np.zeros(T, np.float64)
+    if T <= 0:
+        return out
+
+    ms = _sanitize_marker_records(T, markers, keep_same_kind=True)
+    if not ms:
+        return out
+
+    fps = float(max(1e-6, fps))
+    trans = max(1, int(round(float(max(0.0, transition_ms)) * fps / 1000.0)))
+
+    cur_depth = 0.0
+    cur_kind = "OUT"
+    pos = 0
+    for m in ms:
+        idx = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
+        kind = _marker_kind(m)
+        depth = float(_marker_depth_value(m, kind))
+
+        if idx > pos:
+            out[pos:idx] = cur_depth
+
+        if bool(m.get("cont", False)):
+            # If the continuation marker does not carry an explicit depth, it
+            # inherits the current depth for same-kind holds. This is the
+            # "continued to this point" behavior: no pre-marker ramp.
+            if (not bool(m.get("depth_explicit", False))) and kind == cur_kind:
+                depth = cur_depth
+            cur_depth = float(np.clip(depth, 0.0, 1.0))
+            cur_kind = kind
+            out[idx:min(T, idx + 1)] = cur_depth
+            pos = max(pos, idx + 1)
+            continue
+
+        L = int(min(trans, max(1, T - idx)))
+        if L <= 1:
+            out[idx] = depth
+        else:
+            u = np.linspace(0.0, 1.0, L, endpoint=True, dtype=np.float64)
+            # smoothstep: fast but not a discontinuous zipper
+            u = u * u * (3.0 - 2.0 * u)
+            out[idx:idx + L] = cur_depth + (depth - cur_depth) * u
+        cur_depth = float(np.clip(depth, 0.0, 1.0))
+        cur_kind = kind
+        pos = max(pos, idx + L)
+
+    if pos < T:
+        out[pos:T] = cur_depth
+    return np.clip(out, 0.0, 1.0)
+
+
+def marker_depth_motion01(
+    T: int,
+    markers,
+    fps: float = 30.0,
+    *,
+    transition_ms: float = MARKER_DEPTH_TRANSITION_MS,
+) -> np.ndarray:
+    """0..1 motion amount implied by marker-depth changes; partial depth changes stay partial."""
+    T = int(max(0, T))
+    if T <= 0:
+        return np.zeros(0, np.float64)
+    fps = float(max(1e-6, fps))
+    depth = marker_depth_envelope01(T, markers, fps, transition_ms=transition_ms)
+    if depth.size <= 1:
+        return np.zeros(T, np.float64)
+    d = _deriv_central(depth, 1.0 / fps)
+    trans_s = max(1.0 / fps, float(max(1.0, transition_ms)) / 1000.0)
+    full_rate = 1.0 / trans_s
+    motion = np.clip(np.abs(d) / max(1e-9, full_rate), 0.0, 1.0)
+    if float(MARKER_DEPTH_MOTION_BLUR_SEC) > 0.0 and T >= 3:
+        motion = _gauss_blur1d(motion, max(1.0, float(MARKER_DEPTH_MOTION_BLUR_SEC) * fps))
+    return np.clip(motion, 0.0, 1.0)
+
+
+def marker_depth_dir11(T: int, markers, fps: float = 30.0) -> np.ndarray:
+    """Signed IN-frame marker-depth velocity: + means depth increasing (IN), - means decreasing (OUT)."""
+    T = int(max(0, T))
+    if T <= 0:
+        return np.zeros(0, np.float64)
+    depth = marker_depth_envelope01(T, markers, fps)
+    d = _deriv_central(depth, 1.0 / max(1e-6, float(fps)))
+    return normalize_signed11(d)
+
 
 def pretty_flux_adsr_from_markers01(
     T: int,
@@ -3696,6 +3924,14 @@ def pretty_flux_adsr_from_markers01(
         out = _gauss_blur1d(out, sigma)
         out = np.clip(out, 0.0, 1.0)
 
+    # Marker-depth mode: continuation/depth markers drive motion only at real
+    # depth changes, not across long holds. Strictly replace the synthesized
+    # flux curve so a 5s continuation hold does not become a 5s interpolation.
+    if _marker_has_depth_info(markers):
+        dmot = marker_depth_motion01(T, markers, fps)
+        if dmot.size == out.size and np.any(dmot > 1e-6):
+            out = np.clip(dmot, 0.0, 1.0)
+
     return out
 
 def pretty_flux_adsr_with_onset_snap01(
@@ -3793,36 +4029,7 @@ def _marker_override_u01(*parts) -> float:
 
 def _sanitize_flux_override_markers(markers, T: int):
     """Clamp/sort markers for deterministic override-envelope synthesis."""
-    ms = []
-    T = int(max(0, T))
-    for m in (markers or []):
-        try:
-            idx = int(m.get('idx', -1))
-        except Exception:
-            continue
-        if idx < 0 or idx >= T:
-            continue
-        kind = str(m.get('kind', 'IN') or 'IN').upper()
-        kind = 'OUT' if kind.startswith('O') else 'IN'
-        src_idx = m.get('src_idx', None)
-        if src_idx is not None:
-            try:
-                src_idx = float(src_idx)
-            except Exception:
-                src_idx = None
-        ms.append({'idx': int(idx), 'kind': kind, 'src_idx': src_idx})
-
-    ms.sort(key=lambda z: int(z['idx']))
-
-    # same-sample collision: OUT wins
-    ded = []
-    for m in ms:
-        if ded and int(m['idx']) == int(ded[-1]['idx']):
-            if m['kind'] == 'OUT':
-                ded[-1] = m
-            continue
-        ded.append(m)
-    return ded
+    return _sanitize_marker_records(int(max(0, T)), markers, keep_same_kind=True)
 
 
 def flux_override_from_markers01(
@@ -3886,11 +4093,29 @@ def flux_override_from_markers01(
         floor_i = floor_target01 + ((2.0 * float(u_floor)) - 1.0) * floor_rand01
         floor_i = float(_np.clip(floor_i, 0.0, 0.98))
 
+        start_level = float(out[a - 1]) if a > 0 else 0.0
+
+        if bool(m.get('cont', False)):
+            # Continuation markers are hold/depth anchors, not new Flux hits.
+            # They must preserve the user-selected override floor instead of
+            # retriggering a peak or collapsing the segment to 0.
+            if L <= 1:
+                seg = _np.asarray([max(start_level, floor_i)], _np.float64)
+            else:
+                # Short release into the floor if the prior segment was still decaying.
+                A_hold = int(min(max(1, attack_fr), L))
+                ua = _np.linspace(0.0, 1.0, A_hold, endpoint=True, dtype=_np.float64)
+                segA = start_level + (floor_i - start_level) * (1.0 - _np.power(1.0 - ua, release_curve))
+                if L > A_hold:
+                    seg = _np.concatenate((segA, _np.full(L - A_hold, floor_i, _np.float64)), axis=0)
+                else:
+                    seg = segA[:L]
+            out[a:b] = _np.clip(seg, 0.0, 1.0)
+            continue
+
         peak_lo = max(floor_i + 0.02, 1.0 - peak_rand01)
         peak_i = float(peak_lo + float(u_peak) * max(0.0, 1.0 - peak_lo))
         peak_i = float(_np.clip(peak_i, max(0.02, floor_i + 0.02), 1.0))
-
-        start_level = float(out[a - 1]) if a > 0 else 0.0
 
         if A <= 1:
             segA = _np.asarray([peak_i], _np.float64)
@@ -3911,7 +4136,16 @@ def flux_override_from_markers01(
         sigma = max(1.0, float(post_blur_sec) * float(fps))
         out = _gauss_blur1d(out, sigma)
 
-    return _np.clip(out, 0.0, 1.0)
+    out = _np.clip(out, 0.0, 1.0)
+    if _marker_has_depth_info(markers):
+        dmot = marker_depth_motion01(T, markers, fps)
+        if dmot.size == out.size and _np.any(dmot > 1e-6):
+            # Depth/continuation mode should prevent fake long interpolation, but it
+            # must not destroy the Export Menu override floor.  Depth motion supplies
+            # the hit/pulse layer; the normal override envelope supplies floor/tail.
+            out = _np.clip(_np.maximum(out, dmot), 0.0, 1.0)
+
+    return out
 
 
 # --- Marker-driven motion coupling (export / preview) -----------------------
@@ -4124,6 +4358,24 @@ def couple_motion_to_flux_envelope(
     ref = max(ref_axis, 0.70 * ref_speed, 0.60 * float(REF_SPEED_PPS), 1e-6)
 
     drive = _np.maximum(ft, float(axis_floor01) * (ft > 0.025))
+
+    # Depth-aware marker mode: when continuation/depth markers exist, the
+    # along-axis carrier is driven by *depth changes* instead of by a long
+    # marker-to-marker flux interpolation. Holds therefore stay still.
+    depth_info = bool(_marker_has_depth_info(markers))
+    if depth_info:
+        try:
+            depth01 = marker_depth_envelope01(T, markers, fps)
+            d_depth = _deriv_central(depth01, 1.0 / max(1e-6, float(fps)))
+            dmot = marker_depth_motion01(T, markers, fps)
+            active = dmot > 1e-5
+            # IN-frame sign: +depth means IN, -depth means OUT.
+            dsgn = _np.sign(d_depth)
+            sign_use = _np.where(active, _fill_signed_phase_hint(dsgn, sign_use), sign_use)
+            drive = _np.where(active, dmot, 0.0)
+        except Exception:
+            depth_info = False
+
     v_al_target = sign_use * drive * ref
 
     delta = _np.abs(ft - fm)
@@ -8502,6 +8754,117 @@ def _decode_scene_preview_jpeg(data: bytes) -> Optional[np.ndarray]:
         return None
 
 
+def _stamp_export_frame_sidecars(sc: "Scene", fps: float, *, sync_times: bool = True) -> "Scene":
+    """
+    Canonicalize export sample -> video-frame mapping.
+
+    Root cause guardrail:
+      scene.times, scene.frame_indices, and scene.start can diverge after scene
+      splits, start/end edits, or re-runs.  Preview had recovery logic, but CSV
+      export still wrote rows against scene.times.  This function makes export
+      and preview use the same frame map and, when times are stale, rewrites the
+      export copy's time axis from that frame map.
+
+    This mutates only the scene object passed in; export paths pass deep copies.
+    """
+    try:
+        T = int(len(getattr(sc, "times", []) or []))
+    except Exception:
+        T = 0
+    if T <= 0:
+        return sc
+
+    fps = float(max(1e-6, float(fps)))
+    times = np.asarray(list(getattr(sc, "times", []) or [])[:T], np.float64)
+    start = int(max(0, int(getattr(sc, "start", 0) or 0)))
+    idx_start = start + np.arange(T, dtype=np.int64)
+
+    try:
+        idx_time = np.clip(np.round(times * fps).astype(np.int64), 0, 2**31 - 1)
+    except Exception:
+        idx_time = idx_start.copy()
+
+    idx_recorded = None
+    try:
+        rec = getattr(sc, "frame_indices", None)
+        if rec is not None and len(rec) >= T:
+            idx_recorded = np.asarray(list(rec)[:T], np.int64)
+    except Exception:
+        idx_recorded = None
+
+    def _map_quality(idx):
+        try:
+            idx = np.asarray(idx, np.int64)[:T]
+            d = np.diff(idx)
+            monotone = bool(np.all(d >= 0)) if d.size else True
+            med_step = float(np.median(d)) if d.size else 1.0
+            bad_steps = float(np.mean(np.abs(d - 1.0) > 1.0)) if d.size else 0.0
+            offset_med = float(np.median(np.abs(idx - idx_start))) if T else 0.0
+            return monotone, med_step, bad_steps, offset_med
+        except Exception:
+            return False, 999.0, 1.0, 999999.0
+
+    src = str(os.environ.get("LMT_EXPORT_TIME_SOURCE", "auto") or "auto").strip().lower()
+    source = "times"
+    chosen = idx_time
+
+    if src in ("recorded", "sampled", "samples") and idx_recorded is not None:
+        chosen = idx_recorded; source = "recorded(force)"
+    elif src in ("start", "scene", "scene_start", "contiguous"):
+        chosen = idx_start; source = "scene_start(force)"
+    elif src in ("time", "times", "timestamp"):
+        chosen = idx_time; source = "times(force)"
+    else:
+        # Auto: prefer actual recorded sample frame indices when they look like
+        # a real sampled frame stream.  Otherwise use the time-derived map if it
+        # looks scene-consistent; fall back to scene.start+sample.
+        if idx_recorded is not None:
+            monotone, med_step, bad_steps, _off = _map_quality(idx_recorded)
+            if monotone and bad_steps <= 0.25 and abs(med_step - 1.0) <= 0.75:
+                chosen = idx_recorded; source = "recorded"
+            else:
+                chosen = idx_time; source = "times"
+        else:
+            chosen = idx_time; source = "times"
+
+        monotone, med_step, bad_steps, offset_med = _map_quality(chosen)
+        offset_gate = max(2.0, min(24.0, 0.05 * float(max(1, T))))
+        if (not monotone) or (bad_steps > 0.25) or (abs(med_step - 1.0) > 0.75) or (offset_med > offset_gate):
+            chosen = idx_start; source = f"scene_start(offset={offset_med:.1f})"
+
+    chosen = np.asarray(chosen, np.int64)[:T]
+    if chosen.size < T:
+        chosen = np.pad(chosen, (0, T - chosen.size), mode="edge") if chosen.size else idx_start.copy()
+    chosen = np.maximum(chosen, 0).astype(np.int64)
+
+    # Sidecars used by ExportPreviewDialog and by diagnostics.
+    try:
+        sc.frame_indices = chosen.tolist()
+    except Exception:
+        pass
+    try:
+        setattr(sc, "_export_frame_indices", chosen.tolist())
+        setattr(sc, "_export_frame_indices_time", idx_time.tolist())
+        setattr(sc, "_export_frame_indices_start", idx_start.tolist())
+        setattr(sc, "_export_frame_source", str(source))
+    except Exception:
+        pass
+
+    if sync_times:
+        try:
+            time_idx = idx_time[:T]
+            d = np.diff(time_idx)
+            bad_time_steps = float(np.mean(np.abs(d - 1.0) > 1.0)) if d.size else 0.0
+            time_vs_chosen = float(np.median(np.abs(time_idx - chosen))) if T else 0.0
+            gate = max(1.0, min(12.0, 0.025 * float(max(1, T))))
+            if str(source).startswith("scene_start") or bad_time_steps > 0.25 or time_vs_chosen > gate:
+                sc.times = (chosen.astype(np.float64) / fps).tolist()
+        except Exception:
+            pass
+
+    return sc
+
+
 def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
     """
     Deep-copy `sc` and trim all sampled per-frame lanes to its [start,end] window.
@@ -8526,7 +8889,7 @@ def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
         hi += 1
 
     if lo <= 0 and hi >= len(times):
-        return sc2
+        return _stamp_export_frame_sidecars(sc2, fps, sync_times=True)
 
     sc2.times = times[lo:hi]
     try:
@@ -8579,7 +8942,7 @@ def _trim_scene_copy_for_export(sc: "Scene", fps: float) -> "Scene":
     except Exception:
         pass
 
-    return sc2
+    return _stamp_export_frame_sidecars(sc2, fps, sync_times=True)
 
 
 def _markers_from_spike_lanes(fi, fo):
@@ -8618,6 +8981,8 @@ def _phase_lanes_from_markers(T: int, markers):
     Policy:
       - each marker starts a phase (IN or OUT) that lasts until the next marker
       - leading region before the first marker stays 0 (matches legacy behavior)
+      - continuation markers extend/confirm the current phase but do NOT emit
+        a one-frame impact spike
       - collisions at the same index: OUT wins
     Returns: (fi_spk, fo_spk, fi_ext, fo_ext)
     """
@@ -8629,37 +8994,18 @@ def _phase_lanes_from_markers(T: int, markers):
     if T <= 0 or not markers:
         return fi_spk, fo_spk, fi_ext, fo_ext
 
-    ms = []
-    for m in (markers or []):
-        try:
-            idx = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
-        except Exception:
-            continue
-        kind = str(m.get("kind", "IN") or "IN").upper()
-        kind = "OUT" if kind.startswith("O") else "IN"
-        ms.append({"idx": idx, "kind": kind})
-
+    ms = _sanitize_marker_records(T, markers, keep_same_kind=True)
     if not ms:
         return fi_spk, fo_spk, fi_ext, fo_ext
 
-    ms.sort(key=lambda x: int(x["idx"]))
-
-    # dedupe collisions: OUT wins
-    ded = []
+    # spikes: continuation anchors are holds, not new impact hits
     for m in ms:
-        if ded and int(m["idx"]) == int(ded[-1]["idx"]):
-            if m["kind"] == "OUT":
-                ded[-1] = m
+        if bool(m.get("cont", False)):
             continue
-        ded.append(m)
-    ms = ded
-
-    # spikes
-    for m in ms:
         if m["kind"] == "IN":
-            fi_spk[m["idx"]] = 1.0
+            fi_spk[int(m["idx"])] = 1.0
         else:
-            fo_spk[m["idx"]] = 1.0
+            fo_spk[int(m["idx"])] = 1.0
 
     # phase regions
     for i, m in enumerate(ms):
@@ -8686,48 +9032,30 @@ def _phase_sign_from_markers(T: int, markers) -> np.ndarray:
     if T <= 0 or not markers:
         return s
 
-    ms = []
-    for m in (markers or []):
-        try:
-            idx = int(np.clip(int(m.get("idx", 0)), 0, T - 1))
-        except Exception:
-            continue
-        kind = str(m.get("kind", "IN") or "IN").upper()
-        kind = "OUT" if kind.startswith("O") else "IN"
-        ms.append((idx, kind))
-
+    ms = _sanitize_marker_records(T, markers, keep_same_kind=True)
     if not ms:
         return s
 
-    ms.sort(key=lambda x: int(x[0]))
-
-    # dedupe collisions: OUT wins
-    ded = []
-    for idx, kind in ms:
-        if ded and idx == ded[-1][0]:
-            if kind == "OUT":
-                ded[-1] = (idx, kind)
-            continue
-        ded.append((idx, kind))
-    ms = ded
-
-    for i, (a, kind) in enumerate(ms):
-        b = ms[i + 1][0] if (i + 1) < len(ms) else T
+    for i, m in enumerate(ms):
+        a = int(m["idx"])
+        b = int(ms[i + 1]["idx"]) if (i + 1) < len(ms) else T
         if b <= a:
             continue
-        sgn = +1 if kind == "IN" else -1
+        sgn = +1 if m["kind"] == "IN" else -1
         s[a:b] = sgn
 
     return s
+
 
 # ---------- Marker merge / simplification (export preview) ----------
 
 def _marker_is_edited(m: Dict[str, Any]) -> bool:
     """
-    A marker is considered "edited" if:
-      - it was user-inserted (src_idx is None), OR
-      - it was moved (round(src_idx) != idx)
+    A marker is considered edited/protected if it was inserted/moved,
+    marked as continuation, or carries an explicit depth.
     """
+    if _marker_is_continuation(m) or _marker_depth_is_explicit(m):
+        return True
     src = m.get("src_idx", None)
     if src is None:
         return True
@@ -8768,31 +9096,8 @@ def merge_phase_markers_min_gap(markers: List[Dict[str, Any]],
     gap = int(round((float(merge_ms) / 1000.0) * fps))
     gap = max(0, gap)
 
-    # --- normalize + clamp ---
-    ms: List[Dict[str, Any]] = []
-    for m in (markers or []):
-        try:
-            idx = int(m.get("idx", 0))
-        except Exception:
-            continue
-        idx = int(np.clip(idx, 0, max(0, T - 1)))
-
-        kind = str(m.get("kind", "IN") or "IN").upper()
-        kind = "OUT" if kind.startswith("O") else "IN"
-
-        src = m.get("src_idx", None)
-        if src is not None:
-            try:
-                src = float(src)
-            except Exception:
-                src = None
-
-        ms.append({
-            "idx": idx,
-            "kind": kind,
-            "src_idx": src,
-            "id": m.get("id", None),
-        })
+    # --- normalize + clamp, preserving continuation/depth metadata ---
+    ms: List[Dict[str, Any]] = _sanitize_marker_records(T, markers, keep_same_kind=True)
 
     if not ms:
         return []
@@ -11676,7 +11981,21 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                 sc.dup_flags = list((sc.dup_flags or [])[lo:hi])
             except Exception:
                 pass
+            try:
+                sc.frame_indices = list((getattr(sc, "frame_indices", []) or [])[lo:hi])
+            except Exception:
+                pass
+            try:
+                sc.preview_jpeg = list((getattr(sc, "preview_jpeg", []) or [])[lo:hi])
+            except Exception:
+                pass
             T = len(sc.times)
+
+    try:
+        _stamp_export_frame_sidecars(sc, fps, sync_times=True)
+        T = len(sc.times)
+    except Exception:
+        pass
 
     stem = os.path.splitext(os.path.basename(video_path))[0]
     csv_path = f"{stem}_scene{scene_id:02d}_roi8e_nomask.csv"
@@ -12190,7 +12509,9 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         # Marker-driven Flux should also drive AoI / motion envelopes.
         # Otherwise Flux changes while the motion carrier stays mostly measured,
         # which feels unnaturally decoupled in manual-marker scenes.
-        motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(_override_markers) and (bool(hard_write_flux_aoi) or bool(flux_override_enable))
+        motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(_override_markers) and (
+            bool(hard_write_flux_aoi) or bool(flux_override_enable) or bool(_marker_has_depth_info(_override_markers))
+        )
         if motion_couple:
             vx_s, vy_s, vz_s = couple_motion_to_flux_envelope(
                 vx_s, vy_s, vz_s,
@@ -12292,6 +12613,27 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
         pz_s = leaky_integrate(vz_s, dt, tau_ms=int(getattr(r, 'posz_tau_ms', 800)))
         posz01_s = normalize_unsigned01(pz_s)
 
+        marker_depth01 = None
+        marker_depth_motion = None
+        if _override_markers and _marker_has_depth_info(_override_markers):
+            try:
+                marker_depth01 = marker_depth_envelope01(T, _override_markers, fps)
+                marker_depth_motion = marker_depth_motion01(T, _override_markers, fps)
+                if marker_depth01.size == T:
+                    # Inject manual physical depth into the depth/position lane.
+                    posz01_s = _np.clip(marker_depth01, 0.0, 1.0)
+                    # For AoI motion displays/exports, use marker-depth derivative so
+                    # continuation holds do not generate interpolated thrust.
+                    ddir = marker_depth_dir11(T, _override_markers, fps)
+                    if ddir.size == T and _np.any(_np.abs(ddir) > 1e-6):
+                        axis_v11 = _np.clip(float(io_sign) * ddir, -1.0, 1.0)
+                        axis_dir11 = axis_v11.copy()
+                        axis_acc11 = normalize_signed11(_deriv_central(axis_v11, dt))
+                        axis_jerk11 = normalize_signed11(_deriv_central(_deriv_central(axis_v11, dt), dt))
+            except Exception:
+                marker_depth01 = None
+                marker_depth_motion = None
+
         curv01 = _robust01(_np.abs(curv), p_lo=5, p_hi=95)
         ms_lanes = compute_local_multiscale_lanes(
             flux01=flux_inner,
@@ -12316,6 +12658,10 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
             rows[f"{label}_posx01"]   = posx01_s.tolist()
             rows[f"{label}_posy01"]   = posy01_s.tolist()
             rows[f"{label}_posz01"]   = posz01_s.tolist()
+            if marker_depth01 is not None and len(marker_depth01) == T:
+                rows[f"{label}_marker_depth01"] = _np.clip(marker_depth01, 0.0, 1.0).tolist()
+                if marker_depth_motion is not None and len(marker_depth_motion) == T:
+                    rows[f"{label}_marker_depth_motion01"] = _np.clip(marker_depth_motion, 0.0, 1.0).tolist()
 
             rows[f"{label}_speed01"]  = normalize_unsigned01(speed_s).tolist()
             rows[f"{label}_speed_z01"] = normalize_unsigned01(_np.abs(vz_s)).tolist()
@@ -12552,6 +12898,9 @@ def save_scene_csv_and_push(video_path, scene_id: int, sc: Scene, fps, W, H, rob
                 rows[f"{label}_impact_in_spk01"]  = fi.tolist()
                 rows[f"{label}_impact_out_spk01"] = fo.tolist()
                 rows[f"{label}_impact_score01"] = normalize_unsigned01(S_any).tolist()
+                if marker_depth01 is not None and len(marker_depth01) == T:
+                    rows[f"{label}_impact_in_depth01"] = (_np.asarray(fi_ext, _np.float64) * _np.asarray(marker_depth01, _np.float64)).tolist()
+                    rows[f"{label}_impact_out_depth01"] = (_np.asarray(fo_ext, _np.float64) * _np.asarray(marker_depth01, _np.float64)).tolist()
 
                 rows[f"{label}_impact_hit_spk01"] = hit_spk.tolist()
                 rows[f"{label}_impact_hit_in_spk01"]  = hit_in_spk.tolist()
@@ -14453,6 +14802,16 @@ def run_qt(video_path):
             sc.times = list(sc.times[:cut])
             if getattr(sc, "dup_flags", None):
                 sc.dup_flags = list(sc.dup_flags[:cut])
+            try:
+                if getattr(sc, "frame_indices", None):
+                    sc.frame_indices = list(sc.frame_indices[:cut])
+            except Exception:
+                pass
+            try:
+                if getattr(sc, "preview_jpeg", None):
+                    sc.preview_jpeg = list(sc.preview_jpeg[:cut])
+            except Exception:
+                pass
 
             for attr in (
                 "roi_cx", "roi_cy",
@@ -14521,6 +14880,16 @@ def run_qt(video_path):
             if getattr(scL, "dup_flags", None):
                 scR.dup_flags = list(scL.dup_flags[cut:])
                 scL.dup_flags = list(scL.dup_flags[:cut])
+            try:
+                scR.frame_indices = list((getattr(scL, "frame_indices", []) or [])[cut:])
+                scL.frame_indices = list((getattr(scL, "frame_indices", []) or [])[:cut])
+            except Exception:
+                pass
+            try:
+                scR.preview_jpeg = list((getattr(scL, "preview_jpeg", []) or [])[cut:])
+                scL.preview_jpeg = list((getattr(scL, "preview_jpeg", []) or [])[:cut])
+            except Exception:
+                pass
 
             # Move ALL per-ROI time-aligned series dicts.
             for attr in (
@@ -17048,6 +17417,7 @@ def run_qt(video_path):
             self._sample_preview_jpeg = list(getattr(self.sc, "preview_jpeg", []) or [])
             self._sample_preview_source = "captured" if self._sample_preview_jpeg else "decoder"
             self._markers_by_roi: Dict[int, List[Dict[str, Any]]] = {}
+            self._marker_depth_defaults_by_roi: Dict[int, Dict[str, float]] = {}
             self._dirty_by_roi: Dict[int, bool] = {}
             self._base_preview: Dict[int, Dict[str, np.ndarray]] = {}
             self._infer_component_info_by_roi: Dict[int, Dict[str, Any]] = {}
@@ -17166,8 +17536,8 @@ def run_qt(video_path):
             split.setStretch(1, 2)
 
             self.tbl = QtWidgets.QTableWidget()
-            self.tbl.setColumnCount(4)
-            self.tbl.setHorizontalHeaderLabels(["Type", "Sample", "Time", "Src"])
+            self.tbl.setColumnCount(6)
+            self.tbl.setHorizontalHeaderLabels(["Type", "Sample", "Time", "Src", "Cont", "Depth"])
             self.tbl.horizontalHeader().setStretchLastSection(True)
             self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
             self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -17205,7 +17575,7 @@ def run_qt(video_path):
             infer_row.addWidget(self.btn_clear_infer)
             infer_row.addWidget(self.lbl_infer, 1)
 
-            self.lbl_video_hint = QtWidgets.QLabel("Video rail: left-drag marker(s) or a selected group, right-drag to select a range")
+            self.lbl_video_hint = QtWidgets.QLabel("Video rail: drag markers; Shift+I/O = continuation; Wheel = marker depth; Shift+Wheel = IN/OUT class depth")
             self.lbl_video_hint.setStyleSheet("color: #808080;")
             right.addWidget(self.lbl_video_hint)
 
@@ -17521,6 +17891,14 @@ def run_qt(video_path):
             except Exception:
                 idx_recorded = None
 
+            idx_canonical = None
+            try:
+                side0 = getattr(self.sc, "_export_frame_indices", None)
+                if side0 is not None and len(side0) >= T:
+                    idx_canonical = np.asarray(list(side0)[:T], np.int64)
+            except Exception:
+                idx_canonical = None
+
             # Sidecars created by _trim_scene_copy_for_export when available.
             idx_time = None
             try:
@@ -17543,12 +17921,24 @@ def run_qt(video_path):
             if src in ("recorded", "sampled", "samples") and idx_recorded is not None:
                 self._sample_frame_source = "recorded"
                 return idx_recorded
+            if src in ("canonical", "export") and idx_canonical is not None:
+                self._sample_frame_source = str(getattr(self.sc, "_export_frame_source", "canonical"))
+                return idx_canonical
             if src in ("start", "scene", "scene_start", "contiguous"):
                 self._sample_frame_source = "scene_start"
                 return idx_start
             if src in ("time", "times", "timestamp") and idx_time is not None:
                 self._sample_frame_source = "times"
                 return idx_time
+
+            if idx_canonical is not None and idx_canonical.size == T:
+                try:
+                    dcan = np.diff(idx_canonical)
+                    if (not dcan.size) or (np.all(dcan >= 0) and float(np.mean(np.abs(dcan - 1.0) > 1.0)) <= 0.25):
+                        self._sample_frame_source = str(getattr(self.sc, "_export_frame_source", "canonical"))
+                        return idx_canonical
+                except Exception:
+                    pass
 
             if idx_recorded is not None and idx_recorded.size == T:
                 try:
@@ -17630,6 +18020,7 @@ def run_qt(video_path):
 
         def _build_initial_markers(self):
             self._markers_by_roi.clear()
+            self._marker_depth_defaults_by_roi.clear()
             self._dirty_by_roi.clear()
 
             times = np.asarray(getattr(self.sc, "times", []) or [], np.float64)
@@ -17650,8 +18041,7 @@ def run_qt(video_path):
                             continue
                         if not np.isfinite(t):
                             continue
-                        kind = str(ent.get("kind", "IN") or "IN").upper()
-                        kind = "OUT" if kind.startswith("O") else "IN"
+                        kind = _marker_kind(ent)
                         # nearest sample idx
                         j = int(np.argmin(np.abs(times - t)))
                         if j < 0 or j >= times.size:
@@ -17664,7 +18054,15 @@ def run_qt(video_path):
                                 src_idx = int(np.argmin(np.abs(times - src_t)))
                         except Exception:
                             src_idx = None
-                        ms.append({"idx": int(j), "kind": kind, "src_idx": (int(src_idx) if src_idx is not None else None)})
+                        rec = {
+                            "idx": int(j),
+                            "kind": kind,
+                            "src_idx": (int(src_idx) if src_idx is not None else None),
+                            "cont": bool(_marker_is_continuation(ent)),
+                            "depth": float(_marker_depth_value(ent, kind)),
+                            "depth_explicit": bool(_marker_depth_is_explicit(ent)),
+                        }
+                        ms.append(rec)
                     ms.sort(key=lambda m: int(m.get("idx", 0)))
 
                 # fallback: live spikes (auto detection)
@@ -17678,33 +18076,25 @@ def run_qt(video_path):
                     fi = fi[:T]; fo = fo[:T]
                     ms = _markers_from_spike_lanes(fi, fo)
 
-                # normalize + dedupe collisions (OUT wins)
-                ms2 = []
-                for m in (ms or []):
-                    try:
-                        idx = int(np.clip(int(m.get("idx", 0)), 0, int(times.size - 1)))
-                    except Exception:
-                        continue
-                    kind = str(m.get("kind", "IN") or "IN").upper()
-                    kind = "OUT" if kind.startswith("O") else "IN"
-                    src = m.get("src_idx", None)
-                    if src is not None:
-                        try:
-                            src = int(np.clip(int(src), 0, int(times.size - 1)))
-                        except Exception:
-                            src = None
-                    ms2.append({"idx": idx, "kind": kind, "src_idx": src})
+                ded = _sanitize_marker_records(int(times.size), ms or [], keep_same_kind=True)
 
-                ms2.sort(key=lambda x: int(x["idx"]))
-                ded = []
-                for m in ms2:
-                    if ded and int(m["idx"]) == int(ded[-1]["idx"]):
-                        if m["kind"] == "OUT":
-                            ded[-1] = m
-                        continue
-                    ded.append(m)
+                # Fill defaults for legacy markers and compute per-class defaults.
+                for m in ded:
+                    kind = _marker_kind(m)
+                    if "depth" not in m:
+                        m["depth"] = _marker_default_depth(kind)
+                    m["depth"] = float(np.clip(float(m.get("depth", _marker_default_depth(kind))), 0.0, 1.0))
+                    m["cont"] = bool(_marker_is_continuation(m))
+                    m["depth_explicit"] = bool(_marker_depth_is_explicit(m))
+
                 for i, m in enumerate(ded):
-                    m["id"] = i
+                    m["id"] = int(i)
+
+                def _avg_for(kind: str) -> float:
+                    vals = [float(m.get("depth", _marker_default_depth(kind))) for m in ded if _marker_kind(m) == kind]
+                    return float(np.clip(np.mean(vals), 0.0, 1.0)) if vals else _marker_default_depth(kind)
+
+                self._marker_depth_defaults_by_roi[ri] = {"IN": _avg_for("IN"), "OUT": _avg_for("OUT")}
                 self._markers_by_roi[ri] = ded
                 self._dirty_by_roi[ri] = False
 
@@ -17718,6 +18108,133 @@ def run_qt(video_path):
         def _markers(self, ri: Optional[int] = None) -> List[Dict[str, Any]]:
             ri = self._cur_roi() if ri is None else int(ri)
             return self._markers_by_roi.get(ri, [])
+
+        def _renumber_markers(self, ri: int):
+            ms = sorted(list(self._markers(ri)), key=lambda m: int(m.get("idx", 0)))
+            for i, m in enumerate(ms):
+                m["id"] = int(i)
+            self._markers_by_roi[int(ri)] = ms
+            return ms
+
+        def _depth_defaults(self, ri: int) -> Dict[str, float]:
+            d = self._marker_depth_defaults_by_roi.setdefault(
+                int(ri), {"IN": float(MARKER_DEPTH_DEFAULT_IN), "OUT": float(MARKER_DEPTH_DEFAULT_OUT)}
+            )
+            d["IN"] = float(np.clip(float(d.get("IN", MARKER_DEPTH_DEFAULT_IN)), 0.0, 1.0))
+            d["OUT"] = float(np.clip(float(d.get("OUT", MARKER_DEPTH_DEFAULT_OUT)), 0.0, 1.0))
+            return d
+
+        def _class_depth_default(self, ri: int, kind: str) -> float:
+            kind = "OUT" if str(kind).upper().startswith("O") else "IN"
+            return float(self._depth_defaults(int(ri)).get(kind, _marker_default_depth(kind)))
+
+        def _current_depth_at(self, ri: int, idx: int, kind: str) -> float:
+            ms = self._markers(ri)
+            try:
+                if ms:
+                    env = marker_depth_envelope01(int(self.T), ms, float(self.fps))
+                    if 0 <= int(idx) < env.size:
+                        return float(np.clip(env[int(idx)], 0.0, 1.0))
+            except Exception:
+                pass
+            return self._class_depth_default(int(ri), kind)
+
+        def _nearest_marker_for_depth(self, ri: int):
+            """Return (row, marker, kind). Falls back to current phase kind."""
+            ms = list(self._markers(ri))
+            if not ms:
+                return -1, None, "IN"
+            row = self._selected_row()
+            if 0 <= row < len(ms):
+                return row, ms[row], _marker_kind(ms[row])
+            idx = int(self.sld.value())
+            for i, m in enumerate(ms):
+                if int(m.get("idx", -999999)) == idx:
+                    return i, m, _marker_kind(m)
+            prev = [(i, m) for i, m in enumerate(ms) if int(m.get("idx", -1)) <= idx]
+            if prev:
+                i, m = prev[-1]
+                return i, m, _marker_kind(m)
+            return 0, ms[0], _marker_kind(ms[0])
+
+        def _ensure_depth_marker_at_current(self, ri: int, kind: str):
+            """Get/create a continuation depth anchor at the slider sample."""
+            idx = int(np.clip(int(self.sld.value()), 0, max(0, self.T - 1)))
+            ms = list(self._markers(ri))
+            for m in ms:
+                if int(m.get("idx", -999999)) == idx:
+                    return m
+            depth = self._current_depth_at(ri, idx, kind)
+            m = {
+                "idx": int(idx),
+                "kind": "OUT" if str(kind).upper().startswith("O") else "IN",
+                "src_idx": float(idx),
+                "cont": True,
+                "depth": float(depth),
+                "depth_explicit": True,
+                "id": int(max([int(x.get("id", -1)) for x in ms] + [-1]) + 1),
+            }
+            ms.append(m)
+            ms.sort(key=lambda z: int(z.get("idx", 0)))
+            self._markers_by_roi[int(ri)] = ms
+            self._renumber_markers(int(ri))
+            return m
+
+        def _marker_depth_wheel(self, delta: int, *, shift: bool = False):
+            if self.T <= 0:
+                return False
+            try:
+                steps = float(delta) / 120.0
+            except Exception:
+                steps = 0.0
+            if abs(steps) < 1e-9:
+                return False
+            d = float(MARKER_DEPTH_STEP) * steps
+            ri = self._cur_roi()
+            _row, m, kind = self._nearest_marker_for_depth(ri)
+            kind = "OUT" if str(kind).upper().startswith("O") else "IN"
+
+            ms = list(self._markers(ri))
+            if not ms:
+                m = self._ensure_depth_marker_at_current(ri, kind)
+                ms = list(self._markers(ri))
+
+            changed = False
+            if shift:
+                # Offset the whole class while preserving per-marker differences.
+                targets = [x for x in ms if _marker_kind(x) == kind]
+                if not targets:
+                    targets = [self._ensure_depth_marker_at_current(ri, kind)]
+                for x in targets:
+                    old = float(_marker_depth_value(x, kind))
+                    new = float(np.clip(old + d, 0.0, 1.0))
+                    if abs(new - old) > 1e-9:
+                        x["depth"] = new
+                        x["depth_explicit"] = True
+                        changed = True
+                defs = self._depth_defaults(ri)
+                defs[kind] = float(np.clip(float(defs.get(kind, _marker_default_depth(kind))) + d, 0.0, 1.0))
+            else:
+                # Plain wheel edits selected/exact marker; if none exists at the current sample,
+                # create a continuation depth anchor there.
+                if m is None or int(m.get("idx", -1)) != int(self.sld.value()):
+                    m = self._ensure_depth_marker_at_current(ri, kind)
+                old = float(_marker_depth_value(m, kind))
+                new = float(np.clip(old + d, 0.0, 1.0))
+                if abs(new - old) > 1e-9:
+                    m["depth"] = new
+                    m["depth_explicit"] = True
+                    changed = True
+
+            if not changed:
+                return True
+            self._renumber_markers(ri)
+            self._set_dirty(ri, True)
+            self._rebuild_table()
+            self._sync_table_selection_from_video()
+            self._update_preview()
+            self._refresh_current_preview_overlay()
+            return True
 
         def _set_dirty(self, ri: int, v: bool = True):
             self._dirty_by_roi[int(ri)] = bool(v)
@@ -17735,17 +18252,20 @@ def run_qt(video_path):
                     # Type
                     cbo = QtWidgets.QComboBox()
                     cbo.addItems(["IN", "OUT"])
-                    cbo.setCurrentText(str(m.get("kind", "IN")).upper().startswith("O") and "OUT" or "IN")
+                    cbo.setCurrentText("OUT" if _marker_kind(m) == "OUT" else "IN")
 
                     def _on_kind_changed(txt, row=row):
                         if self._building:
                             return
                         ms2 = self._markers(ri)
                         if 0 <= row < len(ms2):
-                            ms2[row]["kind"] = "OUT" if str(txt).upper().startswith("O") else "IN"
+                            new_kind = "OUT" if str(txt).upper().startswith("O") else "IN"
+                            old_kind = _marker_kind(ms2[row])
+                            ms2[row]["kind"] = new_kind
+                            if old_kind != new_kind and not bool(ms2[row].get("depth_explicit", False)):
+                                ms2[row]["depth"] = self._class_depth_default(ri, new_kind)
                             self._set_dirty(ri, True)
                             self._update_preview()
-
                     cbo.currentTextChanged.connect(_on_kind_changed)
                     self.tbl.setCellWidget(row, 0, cbo)
 
@@ -17755,12 +18275,13 @@ def run_qt(video_path):
                     spn.setMaximum(max(0, self.T - 1))
                     spn.setValue(int(m.get("idx", 0)))
 
-                    def _on_idx_changed(val, row=row):
+                    def _on_idx_changed(val, row=row, spn=spn):
                         if self._building:
                             return
                         ms2 = self._markers(ri)
                         if not (0 <= row < len(ms2)):
                             return
+                        old_idx = int(ms2[row].get("idx", 0))
                         # clamp to preserve ordering
                         mn = 0
                         mx = max(0, self.T - 1)
@@ -17774,6 +18295,13 @@ def run_qt(video_path):
                             spn.setValue(val2)
                             self._building = False
                         ms2[row]["idx"] = int(val2)
+                        if bool(ms2[row].get("cont", False)):
+                            src = ms2[row].get("src_idx", None)
+                            try:
+                                if src is None or int(round(float(src))) == old_idx:
+                                    ms2[row]["src_idx"] = float(val2)
+                            except Exception:
+                                ms2[row]["src_idx"] = float(val2)
                         self._set_dirty(ri, True)
                         self._update_preview()
                     spn.valueChanged.connect(_on_idx_changed)
@@ -17793,10 +18321,52 @@ def run_qt(video_path):
 
                     # Src (read-only)
                     src = m.get("src_idx", None)
-                    st = "" if src is None else f"{int(src)}"
+                    st = "" if src is None else f"{int(round(float(src)))}"
                     it2 = QtWidgets.QTableWidgetItem(st)
                     it2.setFlags(it2.flags() & ~QtCore.Qt.ItemIsEditable)
                     self.tbl.setItem(row, 3, it2)
+
+                    # Continuation / hold marker
+                    chk = QtWidgets.QCheckBox()
+                    chk.setChecked(bool(_marker_is_continuation(m)))
+                    chk.setToolTip("Continuation/hold: same IN/OUT has continued to this point; no new impact spike.")
+
+                    def _on_cont_changed(state, row=row):
+                        if self._building:
+                            return
+                        ms2 = self._markers(ri)
+                        if 0 <= row < len(ms2):
+                            on = bool(state)
+                            ms2[row]["cont"] = on
+                            if on:
+                                try:
+                                    ms2[row]["src_idx"] = float(ms2[row].get("idx", 0))
+                                except Exception:
+                                    pass
+                            self._set_dirty(ri, True)
+                            self._update_preview()
+                    chk.toggled.connect(_on_cont_changed)
+                    self.tbl.setCellWidget(row, 4, chk)
+
+                    # Depth 0..100%
+                    dspn = QtWidgets.QSpinBox()
+                    dspn.setRange(0, 100)
+                    dspn.setSuffix("%")
+                    dspn.setSingleStep(5)
+                    dspn.setValue(int(round(100.0 * float(_marker_depth_value(m, _marker_kind(m))))))
+                    dspn.setToolTip("Physical depth at this marker: 100%=full IN, 50%=half depth, 0%=full OUT.")
+
+                    def _on_depth_changed(val, row=row):
+                        if self._building:
+                            return
+                        ms2 = self._markers(ri)
+                        if 0 <= row < len(ms2):
+                            ms2[row]["depth"] = float(np.clip(float(val) / 100.0, 0.0, 1.0))
+                            ms2[row]["depth_explicit"] = True
+                            self._set_dirty(ri, True)
+                            self._update_preview()
+                    dspn.valueChanged.connect(_on_depth_changed)
+                    self.tbl.setCellWidget(row, 5, dspn)
 
                 self.tbl.resizeColumnsToContents()
             finally:
@@ -17847,27 +18417,50 @@ def run_qt(video_path):
             rows = self.tbl.selectionModel().selectedRows()
             return int(rows[0].row()) if rows else -1
 
-        def _add_marker(self, kind: str):
+        def _add_marker(self, kind: str, continuation: bool = False):
             if self.T <= 0:
                 return
             ri = self._cur_roi()
             kind = "OUT" if str(kind).upper().startswith("O") else "IN"
             idx = int(self.sld.value())
+            continuation = bool(continuation)
 
             ms = list(self._markers(ri))
+            default_depth = self._class_depth_default(ri, kind)
+            if continuation:
+                default_depth = self._current_depth_at(ri, idx, kind)
 
             # collision: overwrite existing at same idx
             for m in ms:
                 if int(m.get("idx", -999)) == idx:
+                    old_kind = _marker_kind(m)
                     m["kind"] = kind
-                    m["src_idx"] = m.get("src_idx", None)  # keep
+                    m["cont"] = continuation
+                    if continuation:
+                        m["src_idx"] = float(idx)
+                    else:
+                        m["src_idx"] = m.get("src_idx", None)  # keep
+                    if old_kind != kind and not bool(m.get("depth_explicit", False)):
+                        m["depth"] = self._class_depth_default(ri, kind)
+                    elif "depth" not in m:
+                        m["depth"] = float(default_depth)
                     self._markers_by_roi[ri] = sorted(ms, key=lambda x: int(x["idx"]))
+                    self._renumber_markers(ri)
                     self._set_dirty(ri, True)
                     self._rebuild_table()
                     self._update_preview()
+                    self._refresh_current_preview_overlay()
                     return
 
-            ms.append({"idx": idx, "kind": kind, "src_idx": None, "id": int(max([m.get("id", -1) for m in ms] + [-1]) + 1)})
+            ms.append({
+                "idx": idx,
+                "kind": kind,
+                "src_idx": (float(idx) if continuation else None),
+                "cont": continuation,
+                "depth": float(default_depth),
+                "depth_explicit": False,
+                "id": int(max([int(m.get("id", -1)) for m in ms] + [-1]) + 1),
+            })
             ms.sort(key=lambda x: int(x["idx"]))
 
             # dedupe again (OUT wins)
@@ -17879,10 +18472,12 @@ def run_qt(video_path):
                     continue
                 ded.append(m)
             self._markers_by_roi[ri] = ded
+            self._renumber_markers(ri)
 
             self._set_dirty(ri, True)
             self._rebuild_table()
             self._update_preview()
+            self._refresh_current_preview_overlay()
 
         def _delete_selected(self):
             ri = self._cur_roi()
@@ -17892,6 +18487,7 @@ def run_qt(video_path):
                 return
             del ms[row]
             self._markers_by_roi[ri] = ms
+            self._renumber_markers(ri)
             self._set_dirty(ri, True)
             self._rebuild_table()
             self._update_preview()
@@ -17928,7 +18524,8 @@ def run_qt(video_path):
             def _collapse_same_kind(seq):
                 out = []
                 for m in seq:
-                    if out and out[-1]["kind"] == m["kind"]:
+                    protected = bool(_marker_is_continuation(m) or _marker_depth_is_explicit(m))
+                    if out and out[-1]["kind"] == m["kind"] and not protected:
                         continue
                     out.append(m)
                 return out
@@ -17966,6 +18563,7 @@ def run_qt(video_path):
                 m["id"] = int(i)
 
             self._markers_by_roi[ri] = ms2
+            self._renumber_markers(ri)
             self._set_dirty(ri, True)
             self._rebuild_table()
             self._update_preview()
@@ -18413,8 +19011,19 @@ def run_qt(video_path):
                 ev_press = self._qt_event_type_value("MouseButtonPress")
                 ev_move = self._qt_event_type_value("MouseMove")
                 ev_release = self._qt_event_type_value("MouseButtonRelease")
+                ev_wheel = self._qt_event_type_value("Wheel")
                 left_btn = self._qt_mouse_button("LeftButton", 1)
                 right_btn = self._qt_mouse_button("RightButton", 2)
+
+                if et == ev_wheel and inside:
+                    try:
+                        delta = int(ev.angleDelta().y())
+                    except Exception:
+                        delta = 0
+                    if delta:
+                        mods = ev.modifiers()
+                        if self._marker_depth_wheel(delta, shift=bool(mods & QtCore.Qt.ShiftModifier)):
+                            return True
 
                 if et == ev_press and inside:
                     btn = ev.button()
@@ -18671,7 +19280,9 @@ def run_qt(video_path):
                 )
                 flux_final = np.clip((1.0 - override_mix) * flux_final + override_mix * flux_override, 0.0, 1.0)
 
-            motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(markers) and (bool(hard_write) or bool(flux_override_enable))
+            motion_couple = bool(MARKER_MOTION_COUPLE_ENABLE) and bool(markers) and (
+                bool(hard_write) or bool(flux_override_enable) or bool(_marker_has_depth_info(markers))
+            )
             if motion_couple:
                 vx_mc, vy_mc, vz_mc = couple_motion_to_flux_envelope(
                     vx_s, vy_s, vz_s,
@@ -19067,6 +19678,15 @@ def run_qt(video_path):
                     cv.circle(vis, (rail_x, my), rad + (1 if mid in sel_ids else 0), (20, 20, 20), 1, cv.LINE_AA)
                     if mid in sel_ids:
                         cv.circle(vis, (rail_x, my), rad + 2, (255, 255, 255), 1, cv.LINE_AA)
+                    if bool(_marker_is_continuation(m)):
+                        cv.putText(vis, "C", (rail_x - 4, my + 4), cv.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2, cv.LINE_AA)
+                        cv.putText(vis, "C", (rail_x - 4, my + 4), cv.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv.LINE_AA)
+                    try:
+                        depth_txt = f"{int(round(100.0 * float(_marker_depth_value(m, kind))))}%"
+                        cv.putText(vis, depth_txt, (min(dw - 44, x1 + 15), my + 4), cv.FONT_HERSHEY_SIMPLEX, 0.34, (0, 0, 0), 2, cv.LINE_AA)
+                        cv.putText(vis, depth_txt, (min(dw - 44, x1 + 15), my + 4), cv.FONT_HERSHEY_SIMPLEX, 0.34, (235, 235, 235), 1, cv.LINE_AA)
+                    except Exception:
+                        pass
                     cv.line(vis, (x1 + 2, my), (min(dw - 4, x1 + 12), my), col, 1 if mid not in sel_ids else 2, cv.LINE_AA)
 
                 if bool(getattr(self, "_pv_rubber_active", False)):
@@ -19645,15 +20265,21 @@ def run_qt(video_path):
                         continue
                     if idx < 0 or idx >= self.T:
                         continue
-                    kind = str(m.get("kind", "IN") or "IN").upper()
-                    kind = "OUT" if kind.startswith("O") else "IN"
+                    kind = _marker_kind(m)
                     src_idx = m.get("src_idx", None)
                     if src_idx is not None:
                         try:
                             src_idx = float(src_idx)
                         except Exception:
                             src_idx = None
-                    out.append({"idx": int(idx), "kind": kind, "src_idx": src_idx})
+                    out.append({
+                        "idx": int(idx),
+                        "kind": kind,
+                        "src_idx": src_idx,
+                        "cont": bool(_marker_is_continuation(m)),
+                        "depth": float(_marker_depth_value(m, kind)),
+                        "depth_explicit": bool(_marker_depth_is_explicit(m)),
+                    })
                 if out:
                     markers_by_roi[int(ri)] = out
 
@@ -19682,9 +20308,14 @@ def run_qt(video_path):
                         continue
                     if idx < 0 or idx >= self.T:
                         continue
-                    kind = str(m.get("kind", "IN") or "IN").upper()
-                    kind = "OUT" if kind.startswith("O") else "IN"
-                    ent = {"t": float(self.sc.times[idx]), "kind": kind}
+                    kind = _marker_kind(m)
+                    ent = {
+                        "t": float(self.sc.times[idx]),
+                        "kind": kind,
+                        "cont": bool(_marker_is_continuation(m)),
+                        "depth": float(_marker_depth_value(m, kind)),
+                        "depth_explicit": bool(_marker_depth_is_explicit(m)),
+                    }
                     src = m.get("src_idx", None)
                     if src is not None:
                         try:
@@ -19723,6 +20354,18 @@ def run_qt(video_path):
             except Exception:
                 pass
             super().closeEvent(ev)
+
+        def wheelEvent(self, ev):
+            try:
+                delta = int(ev.angleDelta().y())
+            except Exception:
+                delta = 0
+            if delta:
+                mods = ev.modifiers()
+                if self._marker_depth_wheel(delta, shift=bool(mods & QtCore.Qt.ShiftModifier)):
+                    ev.accept()
+                    return
+            super().wheelEvent(ev)
 
         def keyPressEvent(self, ev):
             # Navigation + edit hotkeys
@@ -19796,10 +20439,10 @@ def run_qt(video_path):
                 return
 
             if key == QtCore.Qt.Key_I:
-                self._add_marker("IN")
+                self._add_marker("IN", continuation=bool(mod & QtCore.Qt.ShiftModifier))
                 return
             if key == QtCore.Qt.Key_O:
-                self._add_marker("OUT")
+                self._add_marker("OUT", continuation=bool(mod & QtCore.Qt.ShiftModifier))
                 return
             if key == QtCore.Qt.Key_M:
                 self._merge_markers_nearby()
